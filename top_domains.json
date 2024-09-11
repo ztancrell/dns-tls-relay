@@ -1,5 +1,30 @@
 {
+<<<<<<< HEAD
     "top_domains": {},
+=======
+    "top_domains": {
+        "fedoraproject.org": 1,
+        "forksystems.mm.fcix.net": 2,
+        "ocsp.digicert.com": 3,
+        "mirrors.fedoraproject.org": 4,
+        "download.vscodium.com": 5,
+        "reddit.map.fastly.net": 6,
+        "www.startpage.com": 7,
+        "startpage.com": 8,
+        "www.youtube.com": 9,
+        "i.ytimg.com": 10,
+        "mirrors.rpmfusion.org": 11,
+        "rpm.librewolf.net": 12,
+        "mirror.us.leaseweb.net": 13,
+        "wildcard.fedoraproject.org": 14,
+        "www.redditstatic.com": 15,
+        "fonts.gstatic.com": 16,
+        "accounts.google.com": 17,
+        "ocsp.pki.goog": 18,
+        "dyna.wikimedia.org": 19,
+        "coresite.mm.fcix.net": 20
+    },
+>>>>>>> b3995f6 (initial upload of the colored dns-tls-relay)
     "filter": [
         "-",
         "test",
@@ -29,4 +54,8 @@
         "8",
         "9"
     ]
+<<<<<<< HEAD
 }
+=======
+}
+>>>>>>> b3995f6 (initial upload of the colored dns-tls-relay)

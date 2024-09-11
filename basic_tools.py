@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 
 from dns_tls_constants import *
 
+from dnx_shell.utils.shell_colors import text, styles
+
 def load_cache(filename):
     try:
         with open(f'{filename}.json', 'r') as settings:
@@ -46,6 +48,12 @@ def looper(sleep_len):
 
 class Log:
 
+    # color coded log messages
+    # Yellow = VERBOSE
+    # Cyan = CONSOLE
+    # LightGrey = SYSTEM
+    # Red = ERROR
+
     @classmethod
     def setup(cls, *, console, verbose):
         # define function to print log message. this will overload verbose function if enabled.
@@ -54,6 +62,7 @@ class Log:
             @classmethod
             def func(cls, thing_to_print):
                 console_log(f'[{cls.time()}][verbose]{thing_to_print}')
+                console_log(f'[{cls.time()}]' + text.yellow(f'[verbose] ') + text.lightgrey(f'{thing_to_print}'))
 
             # overloading verbose method with newly defined function.
             setattr(cls, 'verbose', func)
@@ -63,6 +72,7 @@ class Log:
             @classmethod
             def func(cls, thing_to_print):
                 console_log(f'[{cls.time()}][console]{thing_to_print}')
+                console_log(f'[{cls.time()}]' + text.cyan(f'[console] ') + text.lightgrey(f'{thing_to_print}'))
 
             # overloading console method with newly defined function.
             setattr(cls, 'console', func)
@@ -70,6 +80,7 @@ class Log:
     @classmethod
     def system(cls, msg):
         console_log(f'[{cls.time()}][system]{msg}')
+        console_log(f'[{cls.time()}]' + text.lightgrey(f'[system] ') + f'{msg}')
 
     @classmethod
     def console(cls, msg):
@@ -78,6 +89,7 @@ class Log:
     @classmethod
     def error(cls, msg):
         console_log(f'[{cls.time()}][error]{msg}')
+        console_log(f'[{cls.time()}]' + text.red(f'[error] ') + f'{msg}')
 
     @staticmethod
     def verbose(msg):
