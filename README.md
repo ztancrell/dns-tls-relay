@@ -1,4 +1,12 @@
 # DNS-over-TLS-Relay
+
+<h3>Changes in this Fork</h3>
+<p> The following enhancements have been made in this fork: </p>
+<ul>
+<li> Added color support for improved readability </li>
+<li> Created a setup script (<code>sudo ./dot-relay.sh</code>) to simplify configuration and execution </li>
+</ul>
+
 <body>
   <h2>
     Privacy proxy converting DNS:UDP to TLS
@@ -54,10 +62,3 @@
     near future this will be added as a program argument so file editing wont be necessary.</i>
   </p>
 </body>
-
-<h3>Changes in this Fork</h3>
-<p> The following enhancements have been made in this fork: </p>
-<ul>
-<li> Added color support for improved readability </li>
-<li> Created a setup script (<code>sudo ./dot-relay.sh</code>) to simplify configuration and execution </li>
-</ul>
