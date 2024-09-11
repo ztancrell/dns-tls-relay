@@ -11,12 +11,9 @@ from dns_tls_constants import hard_out
 from basic_tools import Log
 from dns_tls_relay import DNSRelay
 
-<<<<<<< HEAD
-=======
 # imports the shell_colors for added coolness to the relay
 from dnx_shell.utils.shell_colors import text, styles
 
->>>>>>> b3995f6 (initial upload of the colored dns-tls-relay)
 # override for testing arguments
 DISABLED = False
 
@@ -26,22 +23,6 @@ DEFAULT_SERVER_2 = '1.0.0.1'
 
 # this makes me feel cool. especially when i haven't left the house in forever due to covid-19.
 def display_banner():
-<<<<<<< HEAD
-    print('@@@@@@@    @@@@@@   @@@@@@@     @@@@@@@   @@@@@@@@  @@@        @@@@@@   @@@ @@@')
-    print('@@@@@@@@  @@@@@@@@  @@@@@@@     @@@@@@@@  @@@@@@@@  @@@       @@@@@@@@  @@@ @@@')
-    print('@@!  @@@  @@!  @@@    @@!       @@!  @@@  @@!       @@!       @@!  @@@  @@! !@@')
-    print('!@!  @!@  !@!  @!@    !@!       !@!  @!@  !@!       !@!       !@!  @!@  !@! @!!')
-    print('@!@  !@!  @!@  !@!    @!!       @!@!!@!   @!!!:!    @!!       @!@!@!@!   !@!@! ')
-    print('!@!  !!!  !@!  !!!    !!!       !!@!@!    !!!!!:    !!!       !!!@!!!!    @!!! ')
-    print('!!:  !!!  !!:  !!!    !!:       !!: :!!   !!:       !!:       !!:  !!!    !!:  ')
-    print(':!:  !:!  :!:  !:!    :!:       :!:  !:!  :!:        :!:      :!:  !:!    :!:  ')
-    print(' :::: ::  ::::: ::     ::       ::   :::   :: ::::   :: ::::  ::   :::     ::  ')
-    print(':: :  :    : :  :      :         :   : :  : :: ::   : :: : :   :   : :     :   ')
-    print('by DOWRIGHT | https://github.com/dowrighttv                    ^^^^ for fun ^_^')
-    print('===============================================================================')
-    time.sleep(1)
-    print('starting...')
-=======
     print(text.black(r"""
 @@@@@@@    @@@@@@   @@@@@@@     @@@@@@@   @@@@@@@@  @@@        @@@@@@   @@@ @@@
 @@@@@@@@  @@@@@@@@  @@@@@@@     @@@@@@@@  @@@@@@@@  @@@       @@@@@@@@  @@@ @@@
@@ -57,18 +38,14 @@ def display_banner():
     print(text.darkgrey(r"""by DOWRIGHT | https://github.com/dowrighttv        ^^^^ for fun ^_^""", styles.bold))
     time.sleep(1)
     Log.system(f'DNS TLS Relay is starting...')
->>>>>>> b3995f6 (initial upload of the colored dns-tls-relay)
     time.sleep(.5)
 
 
 if (__name__ == '__main__'):
 
     if (os.getuid() or DISABLED):
-<<<<<<< HEAD
         print('DoTRelay must be ran as root.')
-=======
         Log.error(f'Sorry, DNS-TLS Relay must be ran as root!')
->>>>>>> b3995f6 (initial upload of the colored dns-tls-relay)
         hard_out()
 
     parser = argparse.ArgumentParser(description='Privacy proxy to convert DNS:UDP to TLS w/ local record caching.')
