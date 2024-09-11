@@ -70,10 +70,18 @@ read_config_file() {
 }
 
 write_config_file() {
-  echo "interface_ip=$interface_ip" > "$CONFIG_FILE"
-  echo "primary_dns=$primary_dns" >> "$CONFIG_FILE"
-  echo "secondary_dns=$secondary_dns" >> "$CONFIG_FILE"
-  echo "keep_alive=$keep_alive" >> "$CONFIG_FILE"
+    if [ ! -w "$CONFIG_FILE" ]; then
+	sudo chown $USER:$USER "$CONFIG_FILE"
+	sudo chmod 755 "$CONFIG_FILE"
+        die "Permission denied: $CONFIG_FILE" 1
+    fi
+
+    cat <<EOF > "$CONFIG_FILE"
+interface_ip=$interface_ip
+primary_dns=$primary_dns
+secondary_dns=$secondary_dns
+keep_alive=$keep_alive
+EOF
 }
 
 run_relay() {

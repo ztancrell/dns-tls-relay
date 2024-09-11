@@ -1,7 +1,4 @@
 {
-<<<<<<< HEAD
-    "top_domains": {},
-=======
     "top_domains": {
         "fedoraproject.org": 1,
         "forksystems.mm.fcix.net": 2,
@@ -24,7 +21,6 @@
         "dyna.wikimedia.org": 19,
         "coresite.mm.fcix.net": 20
     },
->>>>>>> b3995f6 (initial upload of the colored dns-tls-relay)
     "filter": [
         "-",
         "test",
@@ -54,8 +50,4 @@
         "8",
         "9"
     ]
-<<<<<<< HEAD
 }
-=======
-}
->>>>>>> b3995f6 (initial upload of the colored dns-tls-relay)
