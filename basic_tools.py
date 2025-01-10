@@ -2,6 +2,8 @@
 
 import json
 
+from cli_colors import CLIColors
+
 from datetime import datetime, timezone
 
 from dns_tls_constants import *
@@ -53,7 +55,7 @@ class Log:
 
             @classmethod
             def func(cls, thing_to_print):
-                console_log(f'[{cls.time()}][verbose]{thing_to_print}')
+                CLIColors.print_ok(f'[{cls.time()}][verbose]{thing_to_print}')
 
             # overloading verbose method with newly defined function.
             setattr(cls, 'verbose', func)
@@ -62,7 +64,7 @@ class Log:
 
             @classmethod
             def func(cls, thing_to_print):
-                console_log(f'[{cls.time()}][console]{thing_to_print}')
+                CLIColors.print_header(f'[{cls.time()}][console]{thing_to_print}')
 
             # overloading console method with newly defined function.
             setattr(cls, 'console', func)
@@ -86,5 +88,7 @@ class Log:
     @staticmethod
     def time(tz=timezone.utc):
         xt = datetime.now(tz).timetuple()
+
+        return f'{xt.tm_mon}/{xt.tm_mday} {xt.tm_hour}:{xt.tm_min}:{xt.tm_sec}'
 
         return f'{xt.tm_mon}/{xt.tm_mday} {xt.tm_hour}:{xt.tm_min}:{xt.tm_sec}'

@@ -148,6 +148,8 @@ class DNSRelay:
         new_dns_id = cls._get_unique_id()
         client_query.generate_dns_query(new_dns_id)
 
+        Log.verbose(f'Handling query for {client_query.qname} with ID {new_dns_id}.')
+
         cls._request_map[new_dns_id] = (top_domain, client_query)
 
         TLSRelay.relay.add(client_query)

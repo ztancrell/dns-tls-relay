@@ -10,6 +10,7 @@ from ipaddress import IPv4Address
 from dns_tls_constants import hard_out
 from basic_tools import Log
 from dns_tls_relay import DNSRelay
+from cli_colors import CLIColors
 
 # override for testing arguments
 DISABLED = False
@@ -33,7 +34,7 @@ def display_banner():
     print('by DOWRIGHT | https://github.com/dowrighttv                    ^^^^ for fun ^_^')
     print('===============================================================================')
     time.sleep(1)
-    print('starting...')
+    CLIColors.print_header('starting...')
     time.sleep(.5)
 
 
@@ -69,4 +70,5 @@ if (__name__ == '__main__'):
 
     display_banner()
 
+    CLIColors.print_header('Starting DNS Relay...')
     DNSRelay.run(args.l, args.k)
