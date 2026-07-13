@@ -15,9 +15,13 @@ from cli_colors import CLIColors
 # override for testing arguments
 DISABLED = False
 
-# must support DNS over TLS (not https/443, tcp/853)
+# must support DNS over TLS (not https/443, tcp/853). deliberately defaulting to two DIFFERENT providers
+# (Cloudflare + Quad9) rather than two IPs of the same provider, so no single company ends up with visibility
+# into 100% of this relay's query history (TLSRelay randomizes which one is preferred on each new connection --
+# see dns_tls_protocols._register_new_socket). NOTE: Quad9 filters known-malicious domains by default, so a
+# domain could occasionally resolve differently depending on which provider happened to answer it.
 DEFAULT_SERVER_1 = '1.1.1.1'
-DEFAULT_SERVER_2 = '1.0.0.1'
+DEFAULT_SERVER_2 = '9.9.9.9'
 
 # this makes me feel cool. especially when i haven't left the house in forever due to covid-19.
 def display_banner():
@@ -60,6 +64,13 @@ if (__name__ == '__main__'):
     parser.add_argument('-k', help='Enables TLS connection keepalives', type=int, choices=[4, 6, 8], default=0)
     parser.add_argument('-c', help='Prints general messages to screen', action='store_true')
     parser.add_argument('-v', help='Prints informational messages to screen', action='store_true')
+    parser.add_argument('-m',
+        help='Paranoid/memory-only mode. Disables all disk persistence of the top domains cache, so no '
+             'plaintext record of locally observed dns query activity can survive a restart or be recovered '
+             'from this device (eg. on physical access/seizure). Top domains will not be permanently cached '
+             'across restarts.',
+        action='store_true'
+    )
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -71,7 +82,7 @@ if (__name__ == '__main__'):
     display_banner()
 
     CLIColors.print_header('Starting DNS Relay...')
-    DNSRelay.run(args.l, args.k)
+    DNSRelay.run(args.l, args.k, persist_top_domains=not args.m)
 
     # DNSRelay.run only starts background threads then returns immediately, so the main thread blocks here to keep
     # the process alive and to give us a clean, single place to intercept ctrl+c instead of relying on the

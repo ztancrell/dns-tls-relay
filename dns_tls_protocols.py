@@ -3,6 +3,7 @@
 import threading
 import ssl
 
+from random import shuffle
 from socket import socket, AF_INET, SOCK_STREAM, IPPROTO_TCP, TCP_NODELAY
 
 from dns_tls_constants import *
@@ -161,7 +162,14 @@ class TLSRelay(ProtoRelay):
     # iterating over dns server list and calling to create a connection to first available server. this will only happen
     # if a socket connection isn't already established when attempting to send query.
     def _register_new_socket(self, client_query=None):
-        for tls_server in self.DNSRelay.dns_servers:
+        # randomizing preference order (rather than always trying primary first) each time a new connection is
+        # needed, so query traffic actually gets split across both configured providers over time instead of
+        # one always absorbing ~100% of it with the other purely as a failover that rarely gets used. done once
+        # per (re)connect rather than per query so an established connection is still reused/pipelined normally.
+        tls_servers = list(self.DNSRelay.dns_servers)
+        shuffle(tls_servers)
+
+        for tls_server in tls_servers:
 
             # skipping over known down server
             if (not tls_server[self._protocol]): continue

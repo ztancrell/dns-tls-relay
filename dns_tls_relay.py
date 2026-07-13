@@ -51,7 +51,7 @@ class DNSRelay:
         self._records_cache_note_lookup = self._records_cache.note_lookup
 
     @classmethod
-    def run(cls, listening_addresses, keepalive_interval):
+    def run(cls, listening_addresses, keepalive_interval, persist_top_domains=True):
         Log.system('Initializing primary service...')
 
         cls.keepalive_interval = keepalive_interval
@@ -68,7 +68,8 @@ class DNSRelay:
         # initializing dns cache/ sending in reference to needed methods for top domains
         cls._records_cache = DNSCache(
             dns_packet=ClientRequest.generate_local_query,
-            request_handler=cls._handle_query
+            request_handler=cls._handle_query,
+            persist=persist_top_domains
         )
 
         threading.Thread(target=cls()._listener).start()
@@ -267,15 +268,21 @@ class DNSCache(dict):
     '''
 
     __slots__ = (
-        '_dns_packet', '_request_handler',
+        '_dns_packet', '_request_handler', '_persist',
 
         '_dom_counter', '_cnter_lock',
         '_prev_top_set', '_decay_rate',
     )
 
-    def __init__(self, *, dns_packet=None, request_handler=None):
+    def __init__(self, *, dns_packet=None, request_handler=None, persist=True):
         self._dns_packet = dns_packet
         self._request_handler = request_handler
+
+        # "paranoid mode" support (run_relay.py -m): when disabled, the top domains cache never touches disk at
+        # all in either direction, so no plaintext record of locally observed query activity can be recovered
+        # from this device (eg. on physical access/seizure) at the cost of the permanently-cached top domains
+        # not surviving a restart.
+        self._persist = persist
 
         self._dom_counter = Counter()
         self._cnter_lock  = threading.Lock()
@@ -377,7 +384,8 @@ class DNSCache(dict):
             # rate limited to make it less aggressive
             fast_sleep(.1)
 
-        tools.write_cache(top_domains)
+        if (self._persist):
+            tools.write_cache(top_domains)
 
     def _rank_top_domains(self):
         '''decays existing scores using the current self tuning rate (pruning anything that falls below one
@@ -429,8 +437,12 @@ class DNSCache(dict):
 
         self._prev_top_set = new_top_set
 
-    # loads top domains from file for persistence between restarts/shutdowns.
+    # loads top domains from file for persistence between restarts/shutdowns. skipped entirely in paranoid/
+    # memory-only mode so nothing is ever read from (or, per _auto_top_domains, written to) disk.
     def _load_top_domains(self):
+        if (not self._persist):
+            return
+
         dns_cache = tools.load_cache('top_domains')
 
         self._dom_counter = Counter({
