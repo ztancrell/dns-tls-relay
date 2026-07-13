@@ -71,3 +71,77 @@ def build_dns_query_hdr(dns_id, arc=0, *, cd):
         (ra <<  7) | (zz <<  6) | (ad <<  5) | (cd << 4) | (rc << 0)
 
     return dns_header_pack(dns_id, f, 1, 0, 0, arc)
+
+def _parse_single_opt_record(additional_records):
+    '''best effort parse of a raw additional records section, returning (udp_size, ext_rcode_flags, options) if
+    it consists of EXACTLY one well formed EDNS0 OPT record (name=root, type=41) -- the overwhelmingly common
+    real world shape when a dns client includes one at all. options is a list of [code, data] lists (mutable,
+    since callers filter/append to it). returns None for anything else (no additional records, multiple/non-OPT
+    records, or anything that doesn't parse cleanly) so the caller can fall back to leaving things completely
+    untouched rather than risking corrupting an unusual/malformed packet.'''
+    if (len(additional_records) < 11 or additional_records[0] != 0):
+        return None
+
+    rtype, udp_size = double_short_unpack(additional_records[1:5])
+    if (rtype != DNS.OPT):
+        return None
+
+    ext_rcode_flags = additional_records[5:9]
+    rdlength = short_unpack(additional_records[9:11])[0]
+    rdata, trailer = additional_records[11:11 + rdlength], additional_records[11 + rdlength:]
+    if (trailer or len(rdata) != rdlength):
+        return None
+
+    options, idx = [], 0
+    while (idx + 4 <= len(rdata)):
+        code, opt_len = double_short_unpack(rdata[idx:idx + 4])
+        opt_data = rdata[idx + 4:idx + 4 + opt_len]
+        if (len(opt_data) != opt_len):
+            return None
+
+        options.append([code, opt_data])
+        idx += 4 + opt_len
+
+    if (idx != len(rdata)):
+        return None
+
+    return udp_size, ext_rcode_flags, options
+
+def sanitize_and_pad_edns(additional_records, unpadded_len):
+    '''privacy hardening for the upstream (WAN facing) leg of the relay:
+
+      1. strips any EDNS Client Subnet option (RFC 7871) -- this relay exists to keep the LAN client's
+         address private from the public resolver, so that option must never be forwarded upstream regardless
+         of whether the originating client (or an upstream forwarder feeding this relay) included one.
+      2. adds an EDNS Padding option (RFC 7830), sized so the overall query lands on an EDNS_PADDING_BLOCK
+         boundary (RFC 8467's recommendation specifically for DNS-over-TLS/HTTPS), so raw query length alone
+         leaks less about which domain is being resolved to anything observing the encrypted TLS stream.
+
+    unpadded_len is the length, in bytes, of the dns message (header + question) NOT including these additional
+    records, needed to compute how much padding lands the total on a block boundary.
+
+    if additional_records is non-empty and doesn't parse as exactly one well formed OPT record, it is returned
+    completely unmodified rather than risking corrupting an unusual/malformed packet -- the client just won't
+    get the padding benefit for that one query.
+    '''
+    if (not additional_records):
+        udp_size, ext_rcode_flags, options = EDNS_DEFAULT_UDP_SIZE, long_pack(0), []
+    else:
+        parsed = _parse_single_opt_record(additional_records)
+        if (parsed is None):
+            return additional_records
+
+        udp_size, ext_rcode_flags, options = parsed
+
+    options = [[code, data] for code, data in options if code != EDNS_ECS_CODE]
+
+    # +4 accounts for the padding option's own code/length header, which is part of the total we're rounding.
+    unpadded_total = unpadded_len + 11 + sum(4 + len(data) for _, data in options) + 4
+    remainder = unpadded_total % EDNS_PADDING_BLOCK
+    pad_len = 0 if not remainder else EDNS_PADDING_BLOCK - remainder
+
+    options.append([EDNS_PADDING_CODE, bytes(pad_len)])
+
+    rdata = byte_join([double_short_pack(code, len(data)) + data for code, data in options])
+
+    return byte_join([b'\x00', double_short_pack(DNS.OPT, udp_size), ext_rcode_flags, short_pack(len(rdata)), rdata])

@@ -3,7 +3,7 @@
 import threading
 import ssl
 
-from socket import socket, AF_INET, SOCK_STREAM
+from socket import socket, AF_INET, SOCK_STREAM, IPPROTO_TCP, TCP_NODELAY
 
 from dns_tls_constants import *
 
@@ -25,6 +25,11 @@ def _build_tls_context():
     tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     tls_context.verify_mode = ssl.CERT_REQUIRED
     tls_context.load_default_certs()
+
+    # explicit floor rather than relying on whatever PROTOCOL_TLS_CLIENT/OpenSSL currently defaults to, so a
+    # future change in defaults (or a downgrade attempt) can't silently negotiate a weaker, legacy protocol
+    # version for DNS traffic that is supposed to be private.
+    tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
 
     return tls_context
 
@@ -239,6 +244,11 @@ class TLSRelay(ProtoRelay):
 
         sock = socket(AF_INET, SOCK_STREAM)
         sock.settimeout(CONNECT_TIMEOUT)
+
+        # dns queries/responses relayed over this connection are small and latency sensitive. disabling Nagle's
+        # algorithm prevents the kernel from holding small writes hoping to coalesce them with more outbound
+        # data, which would otherwise add needless latency to every query for no benefit on this workload.
+        sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
 
         dot_sock = self._tls_context.wrap_socket(sock, server_hostname=tls_server)
         try:

@@ -93,19 +93,18 @@ class ClientRequest:
         if (self.send_data):
             raise RuntimeWarning('send data has already been created for this query.')
 
-        # setting additional data flag in dns header if detected
-        arc = 1 if self.additional_records else 0
-
         # initializing byte array with (2) bytes. these get overwritten with query len actual after processing
         send_data = bytearray(2)
 
-        send_data += build_dns_query_hdr(dns_id, arc, cd=self.cd)
-        send_data += domain_stob(self.qname)
-        send_data += double_short_pack(self.qtype, 1)
+        header_and_question = build_dns_query_hdr(dns_id, 1, cd=self.cd) + domain_stob(self.qname) + double_short_pack(self.qtype, 1)
 
-        # condition favors normal case of no additional records present.
-        if (arc):
-            send_data += self.additional_records
+        # privacy hardening for this upstream/WAN facing leg: strip any EDNS Client Subnet option (this relay
+        # must never forward the LAN client's address to the public resolver) and pad the query to a fixed
+        # block size (RFC 8467) so its raw length leaks less about which domain is being resolved. this always
+        # results in exactly one additional record (an OPT record), so the additional record count is hardcoded
+        # to 1 above rather than being conditional on whether the client happened to send one itself.
+        send_data += header_and_question
+        send_data += sanitize_and_pad_edns(self.additional_records, len(header_and_question))
 
         send_data[:2] = short_pack(len(send_data) - 2)
 

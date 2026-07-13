@@ -52,6 +52,19 @@ TOP_DOMAIN_DECAY_MAX = 0.95  # slowest allowed forgetting rate (most resistant t
 # regardless of whether a network generates tens or tens of thousands of lookups per cycle.
 TOP_DOMAIN_MIN_SHARE = 0.1
 
+# EDNS0 (RFC 6891) option codes relevant to the upstream/WAN facing leg of the relay.
+EDNS_ECS_CODE = 8       # RFC 7871 Client Subnet -- must be stripped, this relay exists to NOT reveal that.
+EDNS_PADDING_CODE = 12  # RFC 7830 Padding
+
+# RFC 8467 recommended padding block size for dns queries sent over a TLS/HTTPS transport -- queries are
+# padded up to the next multiple of this so raw query length alone leaks less about which domain is being
+# resolved to anything observing the encrypted wire.
+EDNS_PADDING_BLOCK = 128
+
+# advertised UDP payload size used only when the relay synthesizes a fresh OPT record from scratch (ie. the
+# LAN client's query didn't already include one). has no real effect here since this leg is TCP/TLS, not UDP.
+EDNS_DEFAULT_UDP_SIZE = 4096
+
 NOT_VALID = -1
 NULL_ADDR = (None, None)
 
