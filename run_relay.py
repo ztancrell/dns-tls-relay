@@ -64,6 +64,10 @@ if (__name__ == '__main__'):
     parser.add_argument('-k', help='Enables TLS connection keepalives', type=int, choices=[4, 6, 8], default=0)
     parser.add_argument('-c', help='Prints general messages to screen', action='store_true')
     parser.add_argument('-v', help='Prints informational messages to screen', action='store_true')
+    parser.add_argument('-d', '--debug',
+        help='Prints debug-level messages to screen (blue). Independent of -v; use both to see all output levels.',
+        action='store_true'
+    )
     parser.add_argument('-m',
         help='Paranoid/memory-only mode. Disables all disk persistence of the top domains cache, so no '
              'plaintext record of locally observed dns query activity can survive a restart or be recovered '
@@ -74,7 +78,7 @@ if (__name__ == '__main__'):
 
     args = parser.parse_args(sys.argv[1:])
 
-    Log.setup(console=args.c, verbose=args.v)
+    Log.setup(console=args.c, verbose=args.v, debug=args.debug)
 
     DNSRelay.dns_servers.primary['ip'] = f'{args.r[0]}'
     DNSRelay.dns_servers.secondary['ip'] = f'{args.r[1]}'

@@ -83,9 +83,13 @@ class ProtoRelay:
 
     def _send_query(self, client_query):
         for attempt in ATTEMPTS:
+            Log.verbose(f'[send] attempt {attempt} for {client_query.qname} '
+                        f'({len(client_query.send_data)} bytes)')
+
             try:
                 self._relay_conn.send(client_query.send_data)
             except OSError:
+                Log.verbose(f'[send] attempt {attempt} failed, reconnecting...')
                 if not self._register_new_socket(): return
 
                 threading.Thread(target=self._recv_handler).start()
@@ -131,6 +135,7 @@ class ProtoRelay:
         # if servers could change during runtime, this has a slight race condition potential, but it shouldn't matter
         # because when changing a server it would be initially set to down (essentially a no-op)
         server = primary if primary['ip'] == remote_server else self.DNSRelay.dns_servers.secondary
+        Log.verbose(f'[{remote_server}] marking server DOWN')
         server[PROTO.DNS_TLS] = False
 
         try:
@@ -169,10 +174,16 @@ class TLSRelay(ProtoRelay):
         tls_servers = list(self.DNSRelay.dns_servers)
         shuffle(tls_servers)
 
+        Log.verbose(f'[connection] preference order: {[s["ip"] for s in tls_servers]}')
+
         for tls_server in tls_servers:
 
             # skipping over known down server
-            if (not tls_server[self._protocol]): continue
+            if (not tls_server[self._protocol]):
+                Log.verbose(f'[connection] {tls_server["ip"]} is down, skipping')
+                continue
+
+            Log.verbose(f'[connection] attempting {tls_server["ip"]}')
 
             # attempt to connect. if successful will return True, otherwise mark server as down and try next server.
             if self._tls_connect(tls_server['ip']): return True
@@ -193,7 +204,7 @@ class TLSRelay(ProtoRelay):
     # receive data from server. if dns response will call parse method else will close the socket.
     # NOTE: only one recv handler will be active at a time so the mutable argument is safe from shared state
     def _recv_handler(self, recv_buffer=[], len=len):
-        Log.verbose(f'[{self._relay_conn.remote_ip}/{self._protocol.name}] Remote server response handler started.')
+        Log.debug(f'[{self._relay_conn.remote_ip}/{self._protocol.name}] Remote server response handler started.')
 
         conn_recv = self._relay_conn.recv
         keepalive_reset = self.keepalive_status.set
@@ -270,8 +281,12 @@ class TLSRelay(ProtoRelay):
         else:
             dot_sock.settimeout(RELAY_TIMEOUT)
 
+            tls_version = dot_sock.version()
+            tls_cipher = dot_sock.cipher()
+            Log.verbose(f'[{tls_server}] TLS {tls_version} cipher={tls_cipher[0]}')
+
             self._relay_conn = RELAY_CONN(
-                tls_server, dot_sock, dot_sock.send, dot_sock.recv, dot_sock.version()
+                tls_server, dot_sock, dot_sock.send, dot_sock.recv, tls_version
             )
 
             return True
@@ -298,7 +313,7 @@ class TLSRelay(ProtoRelay):
 
                 relay_add(self._dns_packet(KEEP_ALIVE_DOMAIN, keepalive=True))
 
-                Log.verbose(f'[keepalive][{keepalive_interval}] Added to relay queue and cleared')
+                Log.debug(f'[keepalive][{keepalive_interval}] Added to relay queue and cleared')
 
 
 class Reachability:
@@ -338,7 +353,7 @@ class Reachability:
             # no check needed if server/proto is known up
             if (secure_server[self._protocol]): continue
 
-            Log.verbose(f'[{secure_server["ip"]}/{self._protocol.name}] Checking reachability of remote DNS server.')
+            Log.debug(f'[{secure_server["ip"]}/{self._protocol.name}] Checking reachability of remote DNS server.')
 
             # if server responds to connection attempt, it will be marked as available
             if self._tls_reachable(secure_server['ip']):

@@ -69,7 +69,7 @@ def looper(sleep_len):
 class Log:
 
     @classmethod
-    def setup(cls, *, console, verbose):
+    def setup(cls, *, console, verbose, debug=False):
         # define function to print log message. this will overload verbose function if enabled.
         if (verbose):
 
@@ -78,7 +78,15 @@ class Log:
                 CLIColors.print_ok(f'[{cls.time()}][verbose]{thing_to_print}')
 
             # overloading verbose method with newly defined function.
-            setattr(cls, 'verbose', func)
+            cls.verbose = func
+
+        if (debug):
+
+            @classmethod
+            def func(cls, thing_to_print):
+                CLIColors.print_info(f'[{cls.time()}][debug]{thing_to_print}')
+
+            cls.debug = func
 
         if (console):
 
@@ -87,7 +95,7 @@ class Log:
                 CLIColors.print_header(f'[{cls.time()}][console]{thing_to_print}')
 
             # overloading console method with newly defined function.
-            setattr(cls, 'console', func)
+            cls.console = func
 
     @classmethod
     def system(cls, msg):
@@ -103,6 +111,10 @@ class Log:
 
     @staticmethod
     def verbose(msg):
+        pass
+
+    @staticmethod
+    def debug(msg):
         pass
 
     @staticmethod

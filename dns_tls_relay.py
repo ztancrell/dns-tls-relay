@@ -117,6 +117,8 @@ class DNSRelay:
             Log.error(f'[parser/client request] {E}')
             return
 
+        Log.verbose(f'[{client_query.qname}] type={client_query.qtype} from {address}')
+
         # if query flag is not set the packet will be assumed malformed and silently dropped
         if (local_domain or client_query.qr != DNS.QUERY): return
 
@@ -126,6 +128,8 @@ class DNSRelay:
         try:
             # A and NS records will have a cache pre-check before sending out
             if (client_query.qtype in [DNS.A, DNS.NS]):
+
+                Log.verbose(f'[{client_query.qname}] routed: cache pre-check')
 
                 # no further action is required if cache contains matching record, otherwise request will be processed,
                 # then added to queue for secure transmission to remote resolver. a genuine cache miss is exactly
@@ -141,9 +145,12 @@ class DNSRelay:
             # towards top domains -- the permanent cache refresh mechanism only ever re-queries the A record for a
             # domain, so ranking one based on AAAA-only traffic wouldn't actually reduce any real upstream chatter.
             elif (client_query.qtype in [DNS.AAAA]):
+                Log.verbose(f'[{client_query.qname}] routed: AAAA (cache bypass)')
                 self._handle_query(client_query)
 
             # NOTE: a request reaching this point falls outside the scope of the relay and will be silently dropped
+            else:
+                Log.verbose(f'[{client_query.qname}] routed: unhandled type ({client_query.qtype}), dropped')
 
         except Exception as E:
             Log.error(f'[handler/client request] {E}')
@@ -154,10 +161,15 @@ class DNSRelay:
         cached_dom = self._records_cache_search(client_query.qname)
         if (cached_dom.records):
 
+            Log.verbose(f'[{client_query.qname}] cache hit: {len(cached_dom.records)} records, '
+                        f'TTL={cached_dom.ttl}')
+
             client_query.generate_cached_response(cached_dom)
             self.send_to_client(client_query.send_data, client_query)
 
             return True
+
+        Log.verbose(f'[{client_query.qname}] cache miss')
 
     @classmethod
     # top_domain will now be set by caller so we don't have to track that within the query object.
@@ -204,7 +216,11 @@ class DNSRelay:
 
         top_domain, client_query = self._request_map_pop(dns_id, (None, None))
         if (not client_query):
+            Log.verbose(f'[responder] orphan response for DNS ID {dns_id}')
             return
+
+        Log.verbose(f'[responder] response for {client_query.qname} (ID {dns_id}) '
+                    f'from {client_query.address}')
 
         try:
             server_response, cache_data = ttl_rewrite(received_data, client_query.dns_id)
@@ -212,9 +228,13 @@ class DNSRelay:
             Log.error(f'[parser/server response] {E}')
         else:
             if (not top_domain):
+                Log.verbose(f'[responder] forwarding {len(server_response)} bytes to '
+                            f'{client_query.address}')
                 self.send_to_client(server_response, client_query)
 
             if (cache_data):
+                Log.verbose(f'[responder] caching {len(cache_data.records)} records for '
+                            f'{client_query.qname}')
                 self._records_cache_add(client_query.qname, cache_data)
 
     @staticmethod

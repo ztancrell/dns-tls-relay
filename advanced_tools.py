@@ -123,7 +123,7 @@ class Initialize:
 
         self._thread_ready.add(threading.get_ident())
 
-        Log.verbose(f'[{self._name}] thread check-in.')
+        Log.debug(f'[{self._name}] thread check-in.')
 
     def wait_in_line(self, *, wait_for):
         '''blocking call to wait for all lower number threads to complete before checking in and returning.
