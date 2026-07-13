@@ -30,6 +30,28 @@ HEARTBEAT_FAIL_LIMIT = 3
 TOP_DOMAIN_COUNT = 20
 KEEP_ALIVE_DOMAIN = 'dnxfirewall.com'
 
+# static, non-sensitive config (safe to version control) used to exclude noisy/rotating hostnames from ever being
+# considered for the top domains permanent cache. matched against individual dot separated labels of the domain
+# (a label "starts with" one of these), not a raw substring-anywhere check -- eg. 'api' matches the label in
+# "api.example.com" or "api2.example.com" but NOT an unrelated domain that merely contains "api" mid word.
+# purely numeric labels (eg. rotating ntp pool/shard hosts like "0.pool.ntp.org") are excluded separately/always,
+# so bare digits do not need to (and should not) appear in this list.
+DOMAIN_FILTER = (
+    '-', 'test', 'detect', 'mozilla', 'oscp', 'ntp', 'api', 'akamai', 'cdn',
+    'microsoft', 'windows', 'ubuntu', 'dns', 'http', 'telemetry', 'wpad', 'ssl',
+)
+
+# top domains heuristic self-tuning safety rails (NOT tuned operating points -- the live decay rate adapts itself
+# between these bounds based on observed top domain churn/stability, so these just prevent runaway degenerate
+# behavior rather than needing to be "the right" value for any particular network/traffic volume).
+TOP_DOMAIN_DECAY_MIN = 0.5   # fastest allowed forgetting rate (most responsive to change)
+TOP_DOMAIN_DECAY_MAX = 0.95  # slowest allowed forgetting rate (most resistant to noise)
+
+# a domain must retain at least this fraction of the current leading domain's (decayed) count to remain eligible
+# for the permanent cache. relative/self-scaling instead of an absolute magic number so it behaves sensibly
+# regardless of whether a network generates tens or tens of thousands of lookups per cycle.
+TOP_DOMAIN_MIN_SHARE = 0.1
+
 NOT_VALID = -1
 NULL_ADDR = (None, None)
 

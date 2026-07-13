@@ -15,6 +15,20 @@ from dns_tls_packets import ClientRequest
 ATTEMPTS = (0, 1)
 
 
+def _build_tls_context():
+    '''creates a TLS client context used to validate the remote DoT resolver's certificate.
+
+    uses the system/OpenSSL default trust store (honoring SSL_CERT_FILE/SSL_CERT_DIR if set) rather than a
+    hardcoded path so this works across distros/containers that don't keep CA certs at the Debian/Ubuntu
+    specific location of /etc/ssl/certs/ca-certificates.crt.
+    '''
+    tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    tls_context.verify_mode = ssl.CERT_REQUIRED
+    tls_context.load_default_certs()
+
+    return tls_context
+
+
 class ProtoRelay:
     '''parent class for udp and tls relays providing standard built in methods to start, check status, or add jobs to
      the work queue. '''
@@ -130,12 +144,7 @@ class TLSRelay(ProtoRelay):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # INITIALIZING TLS CONTEXT
-        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        tls_context.verify_mode = ssl.CERT_REQUIRED
-        tls_context.load_verify_locations('/etc/ssl/certs/ca-certificates.crt')
-
-        self._tls_context = tls_context
+        self._tls_context = _build_tls_context()
 
         # this is needed for now until we determine whether we will put condition on reset/clears on recv
         self.keepalive_status = threading.Event()
@@ -291,12 +300,7 @@ class Reachability:
 
         self._initialize = Initialize(DNSRelay.__name__)
 
-        # INITIALIZING TLS CONTEXT
-        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        tls_context.verify_mode = ssl.CERT_REQUIRED
-        tls_context.load_verify_locations('/etc/ssl/certs/ca-certificates.crt')
-
-        self._tls_context = tls_context
+        self._tls_context = _build_tls_context()
 
     @classmethod
     def run(cls, DNSServer):

@@ -7,7 +7,7 @@ import argparse
 
 from ipaddress import IPv4Address
 
-from dns_tls_constants import hard_out
+from dns_tls_constants import hard_out, ONE_SEC
 from basic_tools import Log
 from dns_tls_relay import DNSRelay
 from cli_colors import CLIColors
@@ -49,7 +49,7 @@ if (__name__ == '__main__'):
 
     parser.add_argument('-l',
         metavar='listen_ip [listen_ip...]', help='List of IP Addresses to listen for requests on',
-        type=IPv4Address, nargs=1, default='127.0.0.1'
+        type=IPv4Address, nargs='+', default=[IPv4Address('127.0.0.1')]
     )
 
     parser.add_argument('-r',
@@ -72,3 +72,13 @@ if (__name__ == '__main__'):
 
     CLIColors.print_header('Starting DNS Relay...')
     DNSRelay.run(args.l, args.k)
+
+    # DNSRelay.run only starts background threads then returns immediately, so the main thread blocks here to keep
+    # the process alive and to give us a clean, single place to intercept ctrl+c instead of relying on the
+    # interpreter's default (noisy) shutdown/thread-join behavior.
+    try:
+        while True:
+            time.sleep(ONE_SEC)
+    except KeyboardInterrupt:
+        CLIColors.print_header('\nShutting down DNS Relay...')
+        hard_out()

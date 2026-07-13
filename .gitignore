@@ -102,3 +102,8 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# runtime-generated cache of locally observed dns query activity (real browsing history) -- must never be
+# tracked. static/non-sensitive defaults (eg. the noise filter) live in dns_tls_constants.py instead.
+top_domains.json
+top_domains.json.tmp
