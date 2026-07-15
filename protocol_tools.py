@@ -7,10 +7,9 @@ def parse_query_name(data, dns_query=None, *, qname=False):
     name and offset integer value if qname arg is True otherwise will only return offset.'''
     offset, contains_pointer, query_name = 0, False, []
 
-    # TODO: this could be problematic since we slice down data. from what i my limited brain understands at the moment,
-    #  data should never be an emtpy byte string if non malformed. the last iteration would have a null byte which is
-    #  what this condition is actually testing against for when to stop iteration.
-    #       // testing suggests this is fine for now
+    if not data:
+        return (0, True) if not qname else (0, True, '')
+
     while data[0]:
 
         # adding 1 to section_len to account for itself

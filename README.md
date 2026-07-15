@@ -1,4 +1,6 @@
 # DNS-over-TLS-Relay
+
+A fork of [DOWRIGHTTV's DNS-TLS Relay](https://github.com/DOWRIGHTTV/dns-tls-relay) that adds features (color output, debug logging, multi-provider resolvers, privacy hardening, self-tuning top domains heuristic, and more). Reviewed and optimized with [OpenCode AI](https://opencode.ai).
 <body>
   <h2>
     Privacy proxy converting DNS:UDP to TLS

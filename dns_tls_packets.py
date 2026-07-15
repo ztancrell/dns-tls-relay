@@ -75,7 +75,7 @@ class ClientRequest:
 
     def generate_cached_response(self, cached_domain):
         if (self.send_data):
-            raise RuntimeWarning('send data has already been created for this query.')
+            raise RuntimeError('send data has already been created for this query.')
 
         send_data = bytearray()
 
@@ -91,7 +91,7 @@ class ClientRequest:
 
     def generate_dns_query(self, dns_id: int) -> None:
         if (self.send_data):
-            raise RuntimeWarning('send data has already been created for this query.')
+            raise RuntimeError('send data has already been created for this query.')
 
         # initializing byte array with (2) bytes. these get overwritten with query len actual after processing
         send_data = bytearray(2)

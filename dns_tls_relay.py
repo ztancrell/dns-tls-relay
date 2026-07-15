@@ -3,9 +3,11 @@
 import threading
 import socket
 import select
+import heapq
 
 from random import randint
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import basic_tools as tools
 
@@ -35,6 +37,7 @@ class DNSRelay:
         {'ip': None, PROTO.DNS_TLS: False}
     )
 
+    _executor = ThreadPoolExecutor(max_workers=4)
     _epoll = select.epoll()
     _registered_socks = {}
     _request_map = {}
@@ -91,7 +94,7 @@ class DNSRelay:
     def _listener(self):
         epoll_poll = self._epoll.poll
         registered_socks_get = self._registered_socks.get
-        parse_packet = self._parse_packet
+        submit = self._executor.submit
 
         for _ in RUN_FOREVER():
 
@@ -107,7 +110,7 @@ class DNSRelay:
                 except OSError:
                     continue
 
-                parse_packet(data, address, sock)
+                submit(self._parse_packet, data, address, sock)
 
     def _parse_packet(self, data, address, sock):
         client_query = ClientRequest(address, sock)
@@ -197,16 +200,10 @@ class DNSRelay:
         request_map = cls._request_map
 
         with cls._id_lock:
-            # NOTE: maybe tune this number. under high load collisions could occur and we don't want it to waste time
-            # because other requests must wait for this process to complete since we are now using a queue system for
-            # while waiting for a decision instead of individual threads.
             for _ in range(100):
-
                 dns_id = randint(70, 32000)
                 if (dns_id not in request_map):
-
                     request_map[dns_id] = 1
-
                     return dns_id
 
     @relay_queue(Log, name='DNSRelay')
@@ -292,6 +289,7 @@ class DNSCache(dict):
 
         '_dom_counter', '_cnter_lock',
         '_prev_top_set', '_decay_rate',
+        '_expiry_heap',
     )
 
     def __init__(self, *, dns_packet=None, request_handler=None, persist=True):
@@ -306,6 +304,7 @@ class DNSCache(dict):
 
         self._dom_counter = Counter()
         self._cnter_lock  = threading.Lock()
+        self._expiry_heap = []
 
         # adaptive decay state -- starts at the most conservative/stable rate until there has been at least one
         # prior cycle to actually measure churn against.
@@ -345,6 +344,7 @@ class DNSCache(dict):
     def add(self, qname, data_to_cache):
         '''add query to cache after calculating expiration time.'''
         self[qname] = data_to_cache
+        heapq.heappush(self._expiry_heap, (data_to_cache.expire, qname))
 
         Log.verbose(f'[{qname}:{data_to_cache.ttl}] Added to standard cache. ')
 
@@ -384,10 +384,12 @@ class DNSCache(dict):
     # automated process to flush the cache if expire time has been reached.
     def _auto_clear_cache(self):
         now = fast_time()
-        expired = [dom for dom, record in self.items() if now > record.expire]
-
-        for domain in expired:
-            del self[domain]
+        heap = self._expiry_heap
+        while heap and heap[0][0] <= now:
+            expire, qname = heapq.heappop(heap)
+            record = self.get(qname)
+            if record and record.expire == expire:
+                del self[qname]
 
     @tools.looper(THREE_MIN)
     # automated process to keep the top queried domains permanently in cache. it will use the current caches packet

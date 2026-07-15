@@ -37,6 +37,8 @@ def write_cache(top_domains):
     tmp_file = 'top_domains.json.tmp'
     with open(tmp_file, 'w') as cache:
         json.dump({'top_domains': top_domains}, cache, indent=4)
+        cache.flush()
+        os.fsync(cache.fileno())
 
     os.replace(tmp_file, 'top_domains.json')
 
