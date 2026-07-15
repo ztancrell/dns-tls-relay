@@ -1,61 +1,54 @@
 # DNS-over-TLS-Relay
 
-A fork of [DOWRIGHTTV's DNS-TLS Relay](https://github.com/DOWRIGHTTV/dns-tls-relay) that adds features (color output, debug logging, multi-provider resolvers, privacy hardening, self-tuning top domains heuristic, and more). 
+A fork of [DOWRIGHTTV's DNS-TLS Relay](https://github.com/DOWRIGHTTV/dns-tls-relay) with enhanced features: color output, debug logging, multi-provider resolvers, privacy hardening, self-tuning top domains heuristic, and more.
 
 Reviewed and optimized with [OpenCode AI](https://opencode.ai).
 
-<body>
-  <h2>
-    Privacy proxy converting DNS:UDP to TLS
-  </h2>
-  <br>
-  <p>
-    <b>Must be ran as root.</b>
-  </p>
-  <samp>
-    usage: run_relay.py [-h] [--version] [-l listen_ip [listen_ip...]]
-                    [-r resolver_ip resolver_ip] [-k {4,6,8}] [-c] [-v]
-  </samp>
-  <br><br>
-  <samp>
-    optional arguments:<br>
-    <p style="margin-left: 40px">
-      -h, --help            show this help message and exit<br><br>
-      --version             show program's version number and exit<br><br>
-      -l ip_addr [ip_addr...]
-                        List of IP Addresses to listen for requests on<br><br>
-      -r ip_addr ip_addr    List of (2) IP Addresses of desired public DoT
-                        resolvers<br><br>
-      -k {4,6,8}            Enables TLS connection keepalives<br><br>
-      -c                    Prints general messages to screen<br><br>
-      -v                    Prints informational messages to screen
-    </p>
-  </samp>
-  <h3>Details</h3>
-  <p>
-    If a listener ip address is not specified, the relay will fallback to the loopback interface [127.0.0.1].
-  </p>
-  <p>
-    DNS over TLS time to resolve is slower than standard UDP <b><i>if a connection to the remote resolver has not already 
-    been established</i></b>. The length in which the remote end waits before closing (timing out due to inactivity) 
-    depends on the resolvers set. Based on general analysis, DNS queries tend to group up as a side effect of system and 
-    relay record caching. Because of this, timeouts are more likely even if the requests per second average is within the 
-    timeout threshold. To offset this, a keepalive option is available on 4, 6, or 8 second intervals which will send a 
-    query to the public resolver to reset its timeout interval.
-  </p>
-  <p>
-    <b>info:</b> By default the public DNS resolvers are set to Cloudflare. If you want to override the default, ensure 
-    the servers support DNS over TLS and are listening on ports TCP 853.
-  </p>
-  <h3>Local Caching</h3>
-  <p>
-    All records will be cached for a minimum of 5 minutes to improve lan efficiency and reduce chatter over the WAN. The 
-    most requested domains on your network will be permanently cached (updated records retrieved every 3 minutes) to 
-    guarantee a cached response for these domains.
-  </p>
-  <p>
-    <b>note:</b> <i>The minimum ttl length can cause issues with CDNs in rare cases where its IPs revolve in shorter 
-    intervals than the minimum ttl. This can be fixed by modfying the constant values in the constants.py file. In the 
-    near future this will be added as a program argument so file editing wont be necessary.</i>
-  </p>
-</body>
+Privacy proxy converting DNS:UDP to TLS.
+
+**Must be run as root.**
+
+```
+usage: run_relay.py [-h] [--version] [-l listen_ip [listen_ip...]]
+                    [-r resolver_ip resolver_ip] [-k {4,6,8}] [-c] [-v] [-d] [-m]
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `-h`, `--help` | Show help message and exit |
+| `--version` | Show version and exit |
+| `-l ip_addr [ip_addr...]` | List of IP addresses to listen for requests on |
+| `-r ip_addr ip_addr` | List of (2) IP addresses of desired public DoT resolvers |
+| `-k {4,6,8}` | Enables TLS connection keepalives (seconds interval) |
+| `-c` | Print general messages to screen |
+| `-v` | Print informational messages to screen |
+| `-d`, `--debug` | Print debug-level messages (blue). Independent of `-v`; use both for full output. |
+| `-m` | Paranoid/memory-only mode. Disables all disk persistence of the top domains cache. |
+
+### Details
+
+If a listener IP address is not specified, the relay falls back to the loopback interface [127.0.0.1].
+
+DNS-over-TLS resolution time is slower than standard UDP **_if a connection to the remote resolver has not already been established_**. DNS queries tend to group up as a side effect of system and relay record caching, making timeouts more likely even if the average QPS is within the timeout threshold. The `-k` keepalive option sends periodic queries to reset the resolver's timeout interval.
+
+By default, the public resolvers are set to **Cloudflare (1.1.1.1)** and **Quad9 (9.9.9.9)** — two different providers so no single company has visibility into 100% of this relay's query history. The relay randomizes which provider is preferred on each new connection. Override with `-r`.
+
+### Fork Features
+
+- **Multi-provider resolvers** — defaults to two different providers (Cloudflare + Quad9) rather than two IPs of the same provider
+- **Color output** — magenta/blue/green/yellow/red terminal output for different log levels
+- **Debug logging** (`-d`) — blue debug messages independent of verbose mode
+- **Paranoid mode** (`-m`) — memory-only operation; no top-domains cache touches disk
+- **Self-tuning top domains** — adaptive decay rate that adjusts based on observed churn; relative qualification threshold that scales with your network's traffic volume
+- **Privacy hardening** — EDNS0 Client Subnet stripping (RFC 7871), EDNS0 padding (RFC 8467, 128-byte block), domain noise filtering
+- **Top domains persistence** — JSON-based across restarts (disabled in paranoid mode)
+- **DNS ID randomization** — random IDs from 70–32000 per query
+- **No CDN issues** — minimum TTL (5 min) and configurable constants in `dns_tls_constants.py`
+
+### Local Caching
+
+All records are cached for a minimum of 5 minutes to improve LAN efficiency and reduce WAN chatter. The most-requested domains on your network are permanently cached (updated every 3 minutes) to guarantee a cached response for these domains.
+
+> **Note:** The minimum TTL can cause issues with CDNs in rare cases where IPs rotate in shorter intervals. Adjust the constants in `dns_tls_constants.py` or use `-m` to avoid disk-based persistence.
