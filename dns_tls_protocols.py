@@ -15,6 +15,42 @@ from dns_tls_packets import ClientRequest
 
 ATTEMPTS = (0, 1)
 
+ALPHA = 0.9  # EMA smoothing factor for latency tracking
+
+
+class ProviderConnection:
+    '''holds the state for a single upstream provider connection. each active provider
+    gets its own socket, latency tracker, and failure counters so the relay can pool
+    connections and select the best performer intelligently.'''
+
+    __slots__ = (
+        'server_ip', 'sock', 'tls_version',
+        'send_cnt', 'last_rcvd', 'last_send_time',
+        'avg_latency', 'success_count', 'fail_count',
+    )
+
+    def __init__(self, server_ip, sock, tls_version):
+        self.server_ip = server_ip
+        self.sock = sock
+        self.tls_version = tls_version
+        self.send_cnt = 0
+        self.last_rcvd = 0
+        self.last_send_time = 0
+        self.avg_latency = 0.0
+        self.success_count = 0
+        self.fail_count = 0
+
+    @property
+    def is_active(self):
+        return self.sock is not None
+
+    def record_latency(self, latency):
+        '''update exponential moving average of response latency.'''
+        if (self.avg_latency == 0):
+            self.avg_latency = latency
+        else:
+            self.avg_latency = ALPHA * self.avg_latency + (1 - ALPHA) * latency
+
 
 def _build_tls_context():
     '''creates a TLS client context used to validate the remote DoT resolver's certificate.
@@ -31,6 +67,9 @@ def _build_tls_context():
     # future change in defaults (or a downgrade attempt) can't silently negotiate a weaker, legacy protocol
     # version for DNS traffic that is supposed to be private.
     tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+    tls_context.set_ciphers(
+        'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS:!SHA1:!CBC'
+    )
 
     return tls_context
 
@@ -53,15 +92,10 @@ class ProtoRelay:
         return object.__new__(cls)
 
     def __init__(self, DNSRelay):
-        '''general constructor. can only be reached through subclass.
-
-        May be expanded.
-
-        '''
+        '''general constructor. can only be reached through subclass.'''
         self.DNSRelay = DNSRelay
 
-        sock = socket()
-        self._relay_conn = RELAY_CONN(None, sock, sock.send, sock.recv, None)
+        self._relay_conn = RELAY_CONN(None, None, None, None, None)
 
         self._send_cnt  = 0
         self._last_rcvd = 0
@@ -72,9 +106,21 @@ class ProtoRelay:
         to and fallback is a secondary relay that can get forwarded a request post failure. initialize will be called
         to run any subclass specific processing then query handler will run indefinitely.'''
         self = cls(DNSRelay)
+        cls._instance = self
 
-        threading.Thread(target=self._fail_detection).start()
-        threading.Thread(target=self.relay).start()
+        t = threading.Thread(target=self._fail_detection)
+        t.daemon = True
+        t.start()
+
+        t = threading.Thread(target=self.relay)
+        t.daemon = True
+        t.start()
+
+    @classmethod
+    def shutdown(cls):
+        '''gracefully close all provider connections and release resources. intended to be
+        called once from DNSRelay.shutdown() during process termination.'''
+        raise NotImplementedError('shutdown must be implemented in the subclass.')
 
     def relay(self):
         '''main relay process for handling the relay queue. will block and run forever.'''
@@ -149,7 +195,8 @@ class TLSRelay(ProtoRelay):
     _dns_packet = ClientRequest.generate_local_query
 
     __slots__ = (
-        '_tls_context', 'keepalive_status'
+        '_tls_context', '_providers', '_providers_lock',
+        '_keepalive_event',
     )
 
     def __init__(self, *args, **kwargs):
@@ -157,58 +204,167 @@ class TLSRelay(ProtoRelay):
 
         self._tls_context = _build_tls_context()
 
-        # this is needed for now until we determine whether we will put condition on reset/clears on recv
-        self.keepalive_status = threading.Event()
+        self._providers = []
+        self._providers_lock = threading.Lock()
 
-        # won't run keep alive thread if not enabled at startup
+        self._keepalive_event = threading.Event()
+
         if (self.DNSRelay.keepalive_interval):
-            threading.Thread(target=self._keepalive_run).start()
+            t = threading.Thread(target=self._keepalive_run)
+            t.daemon = True
+            t.start()
 
-    # iterating over dns server list and calling to create a connection to first available server. this will only happen
-    # if a socket connection isn't already established when attempting to send query.
-    def _register_new_socket(self, client_query=None):
-        # randomizing preference order (rather than always trying primary first) each time a new connection is
-        # needed, so query traffic actually gets split across both configured providers over time instead of
-        # one always absorbing ~100% of it with the other purely as a failover that rarely gets used. done once
-        # per (re)connect rather than per query so an established connection is still reused/pipelined normally.
+    @classmethod
+    def shutdown(cls):
+        Log.system('TLSRelay shutting down provider connections...')
+
+        if not hasattr(cls, '_instance'):
+            return
+        self = cls._instance
+
+        with self._providers_lock:
+            for provider in list(self._providers):
+                try:
+                    if provider.sock:
+                        provider.sock.close()
+                except OSError:
+                    pass
+            self._providers.clear()
+
+        Log.system('TLSRelay shutdown complete.')
+
+    def _best_provider(self):
+        '''return the active provider with the lowest average latency,
+        falling back to any active provider if none have been measured yet.'''
+        with self._providers_lock:
+            active = [p for p in self._providers if p.is_active]
+            if (not active):
+                return None
+
+            best = min(active, key=lambda p: p.avg_latency if p.avg_latency > 0 else float('inf'))
+            return best
+
+    def _establish_connections(self):
+        '''connect to all available providers and start a recv handler for each.
+        returns True if at least one connection was established.'''
         tls_servers = list(self.DNSRelay.dns_servers)
         shuffle(tls_servers)
 
         Log.verbose(f'[connection] preference order: {[s["ip"] for s in tls_servers]}')
 
+        connected = False
         for tls_server in tls_servers:
+            ip = tls_server['ip']
 
-            # skipping over known down server
-            if (not tls_server[self._protocol]):
-                Log.verbose(f'[connection] {tls_server["ip"]} is down, skipping')
+            with self._providers_lock:
+                already = any(p.server_ip == ip and p.is_active for p in self._providers)
+            if (already):
                 continue
 
-            Log.verbose(f'[connection] attempting {tls_server["ip"]}')
+            if (not tls_server[self._protocol]):
+                Log.verbose(f'[connection] {ip} is down, skipping')
+                continue
 
-            # attempt to connect. if successful will return True, otherwise mark server as down and try next server.
-            if self._tls_connect(tls_server['ip']): return True
+            provider = self._tls_connect(ip)
+            if (provider):
+                with self._providers_lock:
+                    self._providers.append(provider)
+                t = threading.Thread(target=self._recv_handler, args=(provider,))
+                t.daemon = True
+                t.start()
+                connected = True
+                Log.system(f'[{ip}/{self._protocol.name}] Connected (pool)')
+            else:
+                self.mark_server_down(remote_server=ip)
 
-            self.mark_server_down(remote_server=tls_server['ip'])
-
-        else:
+        if (not connected):
             self.DNSRelay.tls_up = False
-
             Log.console(f'[{self._protocol}] No DNS servers available.')
 
-    @relay_queue(Log, name='TLSRelay')
-    # NOTE: this function seems basic, but was stripped down from dnxfirewall which contains ability to fallback to UDP.
-    def relay(self, client_query):
+        self.DNSRelay.tls_up = connected
+        return connected
 
+    def _reconnect_provider(self, provider):
+        '''close and reconnect a single provider. used when a send fails on
+        an otherwise-active connection.'''
+        try:
+            provider.sock.close()
+        except OSError:
+            pass
+
+        provider.sock = None
+        Log.verbose(f'[{provider.server_ip}] Reconnecting...')
+
+        new_provider = self._tls_connect(provider.server_ip)
+        if (new_provider):
+            with self._providers_lock:
+                self._providers.remove(provider)
+                self._providers.append(new_provider)
+            t = threading.Thread(target=self._recv_handler, args=(new_provider,))
+            t.daemon = True
+            t.start()
+            return True
+
+        with self._providers_lock:
+            if provider in self._providers:
+                self._providers.remove(provider)
+        self.mark_server_down(remote_server=provider.server_ip)
+        return False
+
+    # overrides ProtoRelay._register_new_socket to work with the pool
+    def _register_new_socket(self, client_query=None):
+        with self._providers_lock:
+            active = [p for p in self._providers if p.is_active]
+        if (active):
+            return True
+
+        return self._establish_connections()
+
+    @relay_queue(Log, name='TLSRelay')
+    def relay(self, client_query):
         self._send_query(client_query)
 
-    # receive data from server. if dns response will call parse method else will close the socket.
-    # NOTE: only one recv handler will be active at a time so the mutable argument is safe from shared state
-    def _recv_handler(self, recv_buffer=[], len=len):
-        Log.debug(f'[{self._relay_conn.remote_ip}/{self._protocol.name}] Remote server response handler started.')
+    def _send_query(self, client_query):
+        '''send a query to upstream providers. for top-domain refresh/keepalive
+        (single-answer-needed), uses only the best provider. for client queries,
+        fans out to all active providers and takes the first response.'''
+        with self._providers_lock:
+            active = [p for p in self._providers if p.is_active]
 
-        conn_recv = self._relay_conn.recv
-        keepalive_reset = self.keepalive_status.set
+        if (not active):
+            if (not self._register_new_socket()):
+                return
+            with self._providers_lock:
+                active = [p for p in self._providers if p.is_active]
 
+        if (not active):
+            return
+
+        # fan-out: send to all active providers for client queries,
+        # but only the best one for internal refresh/keepalive traffic
+        targets = active if not getattr(client_query, 'top_domain', False) else [self._best_provider() or active[0]]
+
+        for provider in targets:
+            try:
+                provider.sock.send(client_query.send_data)
+                provider.send_cnt += 1
+                provider.last_send_time = fast_time()
+                Log.console(
+                    f'[{provider.server_ip}/{provider.tls_version}] Sent {client_query.qname}'
+                )
+            except (OSError, AttributeError):
+                Log.verbose(f'[{provider.server_ip}] send failed, attempting reconnect...')
+                self._reconnect_provider(provider)
+
+    def _recv_handler(self, provider):
+        '''per-connection receive handler. reads responses from a single provider's
+        socket, tracks the response latency for that provider, and feeds completed
+        dns responses into the relay's responder queue.'''
+        Log.debug(f'[{provider.server_ip}/{self._protocol.name}] Response handler started.')
+
+        conn_recv = provider.sock.recv
+
+        recv_buffer = []
         recv_buff_append = recv_buffer.append
         recv_buff_clear  = recv_buffer.clear
 
@@ -218,55 +374,63 @@ class TLSRelay(ProtoRelay):
             try:
                 data_from_server = conn_recv(2048)
 
-            # NOTE: local socket timeout isn't a big deal. will clean up per normal.
             except OSError:
                 break
 
             else:
-                # if no data is received/EOF the remote end has closed the connection
-                if (not data_from_server): break
+                if (not data_from_server):
+                    break
 
-                # resetting fail detection
-                self._last_rcvd = fast_time()
-                self._send_cnt = 0
+                now = fast_time()
+                provider.last_rcvd = now
+                provider.send_cnt = 0
 
-                # breaking keepalive timer from blocking, which will effectively reset the timer.
-                keepalive_reset()
+                if (provider.last_send_time):
+                    provider.record_latency(now - provider.last_send_time)
+
+                self._keepalive_event.set()
 
                 recv_buff_append(data_from_server)
                 while recv_buffer:
                     current_data = byte_join(recv_buffer)
-                    data_len, data = short_unpackf(current_data)[0], current_data[2:]
 
-                    # more data is needed for a complete response. NOTE: this scenario is kind of dumb and shouldn't
-                    # happen unless the server sends length of record and record separately.
-                    if (len(data) < data_len): break
+                    # need at least 2 bytes for the DNS-over-TLS length prefix
+                    if (len(current_data) < 2): break
 
-                    # clearing the buffer since we either have nothing left to process or we will re add the leftover
-                    # bytes back with the next condition.
+                    data_len = short_unpackf(current_data)[0]
+                    total_len = 2 + data_len
+
+                    # minimum valid DNS message is 12 bytes (header only); reject
+                    # malformed frames that would desync the parser or waste memory.
+                    if (data_len < 12):
+                        recv_buff_clear()
+                        Log.error(f'[{provider.server_ip}] invalid frame length ({data_len}), discarding')
+                        break
+
+                    if (len(current_data) < total_len): break
+
                     recv_buff_clear()
+                    frame = current_data[2:total_len]
 
-                    # if expected data length is greater than local buffer, multiple records were returned in a batch
-                    # so appending leftover bytes after removing the current records data from buffer.
-                    if (len(data) > data_len):
-                        recv_buff_append(data[data_len:])
+                    if (len(current_data) > total_len):
+                        recv_buff_append(current_data[total_len:])
 
-                    # ignoring internally generated connection keepalives
-                    if (data[0] != DNS.KEEPALIVE):
-                        responder_add(data[:data_len])
+                    if (frame[0] != DNS.KEEPALIVE):
+                        responder_add(frame)
 
-        self._relay_conn.sock.close()
+        provider.sock.close()
+        provider.sock = None
+
+        Log.verbose(f'[{provider.server_ip}/{self._protocol.name}] Connection closed.')
 
     def _tls_connect(self, tls_server):
-
+        '''connect to a single DoT resolver and return a ProviderConnection,
+        or None on failure.'''
         Log.verbose(f'[{tls_server}/{self._protocol.name}] Opening secure socket.')
 
         sock = socket(AF_INET, SOCK_STREAM)
         sock.settimeout(CONNECT_TIMEOUT)
 
-        # dns queries/responses relayed over this connection are small and latency sensitive. disabling Nagle's
-        # algorithm prevents the kernel from holding small writes hoping to coalesce them with more outbound
-        # data, which would otherwise add needless latency to every query for no benefit on this workload.
         sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
 
         dot_sock = self._tls_context.wrap_socket(sock, server_hostname=tls_server)
@@ -285,46 +449,85 @@ class TLSRelay(ProtoRelay):
             tls_cipher = dot_sock.cipher()
             Log.verbose(f'[{tls_server}] TLS {tls_version} cipher={tls_cipher[0]}')
 
-            self._relay_conn = RELAY_CONN(
-                tls_server, dot_sock, dot_sock.send, dot_sock.recv, tls_version
-            )
-
-            return True
+            return ProviderConnection(tls_server, dot_sock, tls_version)
 
         return None
 
-    # TODO: (for dnx) see if configured interval changes should be reset or if it would be ok to let them take effect
-    #  on the next iteration.
+    def mark_server_down(self, *, remote_server=None):
+        '''mark a provider as down in the server status dict (no-op for closing the
+        socket since the pool manages that per-connection).'''
+        if (not remote_server):
+            return
+
+        primary = self.DNSRelay.dns_servers.primary
+        server = primary if primary['ip'] == remote_server else self.DNSRelay.dns_servers.secondary
+        Log.verbose(f'[{remote_server}] marking server DOWN')
+        server[PROTO.DNS_TLS] = False
+
     def _keepalive_run(self):
+        '''periodically sends a keepalive query to prevent the resolver's idle timeout
+        from closing the connection. sends on the best-performing provider.'''
         keepalive_interval = self.DNSRelay.keepalive_interval
-        keepalive_timer = self.keepalive_status.wait
-        keepalive_continue = self.keepalive_status.clear
+        keepalive_timer = self._keepalive_event.wait
+        keepalive_continue = self._keepalive_event.clear
 
         relay_add = self.relay.add
 
         for _ in RUN_FOREVER():
-
-            # returns True if reset which means we do not need to send a keep alive. If timeout is reached will return
-            # False notifying that a keepalive should be sent
             if keepalive_timer(keepalive_interval):
                 keepalive_continue()
-
             else:
-
                 relay_add(self._dns_packet(KEEP_ALIVE_DOMAIN, keepalive=True))
+                Log.debug(f'[keepalive][{keepalive_interval}] Added to relay queue')
 
-                Log.debug(f'[keepalive][{keepalive_interval}] Added to relay queue and cleared')
+    @looper(FIVE_SEC)
+    def _fail_detection(self):
+        '''check all active providers for failure conditions. a provider that has
+        sent HEARTBEAT_FAIL_LIMIT queries without a response in the last FIVE_SEC
+        is marked as down and removed from the pool. also checks for servers that
+        have recovered (Reachability marked them up) and adds them to the pool.'''
+        now = fast_time()
+        with self._providers_lock:
+            for provider in list(self._providers):
+                if (not provider.is_active):
+                    self._providers.remove(provider)
+                    continue
+
+                if (now - provider.last_rcvd >= FIVE_SEC and provider.send_cnt >= HEARTBEAT_FAIL_LIMIT):
+                    Log.verbose(f'[{provider.server_ip}] marking DOWN (fail detection)')
+                    self.mark_server_down(remote_server=provider.server_ip)
+                    provider.sock.close()
+                    provider.sock = None
+                    self._providers.remove(provider)
+
+        with self._providers_lock:
+            if (not self._providers):
+                self.DNSRelay.tls_up = False
+
+        # pick up any servers that Reachability has marked as recovered
+        for tls_server in self.DNSRelay.dns_servers:
+            ip = tls_server['ip']
+            if (not tls_server[self._protocol]):
+                continue
+            with self._providers_lock:
+                already = any(p.server_ip == ip and p.is_active for p in self._providers)
+            if (not already):
+                Log.verbose(f'[{ip}] server recovered, adding to pool')
+                self._establish_connections()
+                break
 
 
 class Reachability:
     '''this class is used to determine whether a remote dns server has recovered from an outage or
-    slow response times.'''
+    slow response times. backoff is applied so downed servers aren't hammered with connection
+    attempts every cycle.'''
 
     __slots__ = (
         '_protocol', 'DNSRelay', '_initialize',
 
 
-        '_tls_context', '_udp_query'
+        '_tls_context', '_udp_query',
+        '_backoff', '_backoff_next'
     )
 
     def __init__(self, protocol, DNSRelay):
@@ -335,6 +538,9 @@ class Reachability:
 
         self._tls_context = _build_tls_context()
 
+        self._backoff = {}
+        self._backoff_next = {}
+
     @classmethod
     def run(cls, DNSServer):
         '''starting remote server responsiveness detection as a thread. the remote servers will only be checked for
@@ -342,25 +548,44 @@ class Reachability:
 
         # initializing tls instance and starting thread
         reach_tls = cls(PROTO.DNS_TLS, DNSServer)
-        threading.Thread(target=reach_tls.tls).start()
+        t = threading.Thread(target=reach_tls.tls)
+        t.daemon = True
+        t.start()
 
         reach_tls._initialize.wait_for_threads(count=1)
 
     @looper(FIVE_SEC)
     def tls(self):
+        now = fast_time()
+
         for secure_server in self.DNSRelay.dns_servers:
+            ip = secure_server['ip']
 
             # no check needed if server/proto is known up
-            if (secure_server[self._protocol]): continue
+            if (secure_server[self._protocol]):
+                self._backoff.pop(ip, None)
+                self._backoff_next.pop(ip, None)
+                continue
 
-            Log.debug(f'[{secure_server["ip"]}/{self._protocol.name}] Checking reachability of remote DNS server.')
+            # backoff: skip check if not enough time has passed since last attempt
+            if ip in self._backoff_next and now < self._backoff_next[ip]:
+                continue
+
+            Log.debug(f'[{ip}/{self._protocol.name}] Checking reachability of remote DNS server.')
 
             # if server responds to connection attempt, it will be marked as available
-            if self._tls_reachable(secure_server['ip']):
+            if self._tls_reachable(ip):
                 secure_server[PROTO.DNS_TLS] = True
                 self.DNSRelay.tls_up = True
 
-                Log.system(f'[{secure_server["ip"]}/{self._protocol.name}] DNS server is reachable.')
+                self._backoff.pop(ip, None)
+                self._backoff_next.pop(ip, None)
+
+                Log.system(f'[{ip}/{self._protocol.name}] DNS server is reachable.')
+            else:
+                self._backoff[ip] = min(self._backoff.get(ip, FIVE_SEC) * 2, THIRTY_SEC)
+                self._backoff_next[ip] = now + self._backoff[ip]
+                Log.verbose(f'[{ip}] reachability failed, next check in {self._backoff[ip]}s')
 
         self._initialize.done()
 

@@ -52,6 +52,18 @@ TOP_DOMAIN_DECAY_MAX = 0.95  # slowest allowed forgetting rate (most resistant t
 # regardless of whether a network generates tens or tens of thousands of lookups per cycle.
 TOP_DOMAIN_MIN_SHARE = 0.1
 
+# multi-timeframe scoring: burst counter decays fast to respond to traffic spikes; stability counter decays
+# slowly to recognize long-term patterns. combined score = burst + stability.
+BURST_DECAY_RATE = 0.3         # fast decay for burst responsiveness (captures spikes)
+STABILITY_DECAY_RATE = 0.95    # slow decay for long-term pattern recognition
+BURST_ADAPT_MIN = 0.1          # burst can't decay faster than this
+BURST_ADAPT_MAX = 0.5          # burst can't decay slower than this
+
+# negative caching: remembers nxdomain/servfail responses so repeat lookups for the same nonexistent
+# domain don't hit the upstream resolver again before the negative TTL expires.
+NEGATIVE_CACHE_TTL = 30        # seconds to cache nxdomain/servfail
+NEGATIVE_CACHE_CLEAN_INTERVAL = 300  # seconds between negative cache expiry sweeps
+
 # EDNS0 (RFC 6891) option codes relevant to the upstream/WAN facing leg of the relay.
 EDNS_ECS_CODE = 8       # RFC 7871 Client Subnet -- must be stripped, this relay exists to NOT reveal that.
 EDNS_PADDING_CODE = 12  # RFC 7830 Padding

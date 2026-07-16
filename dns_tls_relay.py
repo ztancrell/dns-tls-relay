@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import threading
 import socket
 import select
@@ -37,14 +38,19 @@ class DNSRelay:
         {'ip': None, PROTO.DNS_TLS: False}
     )
 
-    _executor = ThreadPoolExecutor(max_workers=4)
+    _executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) + 4))
     _epoll = select.epoll()
     _registered_socks = {}
+    _socks_lock = threading.Lock()
     _request_map = {}
     _id_lock = threading.Lock()
 
+    _shutdown_event = threading.Event()
+
     def __init__(self):
-        threading.Thread(target=self.responder).start()
+        t = threading.Thread(target=self.responder)
+        t.daemon = True
+        t.start()
 
         # assigning object methods to prevent lookup
         self._request_map_pop = self._request_map.pop
@@ -52,6 +58,45 @@ class DNSRelay:
         self._records_cache_add = self._records_cache.add
         self._records_cache_search = self._records_cache.search
         self._records_cache_note_lookup = self._records_cache.note_lookup
+
+    @classmethod
+    def shutdown(cls):
+        Log.system('Shutting down DNS Relay...')
+
+        cls._shutdown_event.set()
+
+        if hasattr(cls, '_records_cache'):
+            if cls._records_cache._persist:
+                top_domains = cls._records_cache._rank_top_domains()
+                if top_domains:
+                    tools.write_cache(top_domains)
+
+            try:
+                cls._records_cache._negative_cache.clear()
+            except AttributeError:
+                pass
+
+        if hasattr(cls, '_epoll'):
+            try:
+                cls._epoll.close()
+            except OSError:
+                pass
+
+        with cls._socks_lock:
+            for fd, l_sock in list(cls._registered_socks.items()):
+                try:
+                    l_sock.socket.close()
+                except OSError:
+                    pass
+            cls._registered_socks.clear()
+
+        tmp = 'top_domains.json.tmp'
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+
+        Log.system('DNS Relay shutdown complete.')
 
     @classmethod
     def run(cls, listening_addresses, keepalive_interval, persist_top_domains=True):
@@ -63,7 +108,9 @@ class DNSRelay:
         # NOTE: threading.Thread(target=service_loop._listener).start() starting a registration thread for all available
         # interfaces. once registered the threads will exit.
         for ip_addr in listening_addresses:
-            threading.Thread(target=cls._register, args=(f'{ip_addr}',)).start()
+            t = threading.Thread(target=cls._register, args=(f'{ip_addr}',))
+            t.daemon = True
+            t.start()
 
         Reachability.run(cls)
         TLSRelay.run(cls)
@@ -75,7 +122,9 @@ class DNSRelay:
             persist=persist_top_domains
         )
 
-        threading.Thread(target=cls()._listener).start()
+        t = threading.Thread(target=cls()._listener)
+        t.daemon = True
+        t.start()
 
     @classmethod
     def _register(cls, listener_ip):
@@ -85,23 +134,29 @@ class DNSRelay:
         Log.system(f'[{listener_ip}] Started registration.')
 
         l_sock = cls._listener_sock(listener_ip)
-        cls._registered_socks[l_sock.fileno()] = L_SOCK(listener_ip, l_sock, l_sock.sendto, l_sock.recvfrom)
-
-        cls._epoll.register(l_sock.fileno(), select.EPOLLIN)
+        with cls._socks_lock:
+            cls._registered_socks[l_sock.fileno()] = L_SOCK(listener_ip, l_sock, l_sock.sendto, l_sock.recvfrom)
+            cls._epoll.register(l_sock.fileno(), select.EPOLLIN)
 
         Log.system(f'[{listener_ip}][{l_sock.fileno()}] Listener registered.')
 
     def _listener(self):
         epoll_poll = self._epoll.poll
-        registered_socks_get = self._registered_socks.get
+        socks_lock = self._socks_lock
+        registered_socks = self._registered_socks
         submit = self._executor.submit
+        shutdown_event = DNSRelay._shutdown_event
 
-        for _ in RUN_FOREVER():
+        while not shutdown_event.is_set():
 
-            l_socks = epoll_poll()
+            l_socks = epoll_poll(timeout=1)
             for fd, _ in l_socks:
 
-                sock = registered_socks_get(fd)
+                with socks_lock:
+                    sock = registered_socks.get(fd)
+
+                if (sock is None):
+                    continue
 
                 try:
                     data, address = sock.recvfrom(2048)
@@ -129,6 +184,13 @@ class DNSRelay:
         # request cannot raise an uncaught exception and kill the single listener thread servicing every
         # registered interface. any failure here results in the individual request being dropped and logged.
         try:
+            # check negative cache before any upstream work
+            if (self._records_cache.is_negative(client_query.qname)):
+                Log.verbose(f'[{client_query.qname}] negative cache hit, returning nxdomain')
+                client_query.generate_negative_response()
+                self.send_to_client(client_query.send_data, client_query)
+                return
+
             # A and NS records will have a cache pre-check before sending out
             if (client_query.qtype in [DNS.A, DNS.NS]):
 
@@ -220,10 +282,17 @@ class DNSRelay:
                     f'from {client_query.address}')
 
         try:
-            server_response, cache_data = ttl_rewrite(received_data, client_query.dns_id)
+            server_response, cache_data, rcode = ttl_rewrite(received_data, client_query.dns_id)
         except Exception as E:
             Log.error(f'[parser/server response] {E}')
         else:
+            # cache NXDOMAIN (rc=3) and SERVFAIL (rc=2) responses so repeat lookups don't hit upstream
+            if (rcode in (2, 3) and not top_domain):
+                Log.verbose(f'[responder] negative response (rc={rcode}) for {client_query.qname}')
+                self._records_cache.add_negative(client_query.qname)
+                self.send_to_client(server_response, client_query)
+                return
+
             if (not top_domain):
                 Log.verbose(f'[responder] forwarding {len(server_response)} bytes to '
                             f'{client_query.address}')
@@ -287,9 +356,11 @@ class DNSCache(dict):
     __slots__ = (
         '_dns_packet', '_request_handler', '_persist',
 
-        '_dom_counter', '_cnter_lock',
-        '_prev_top_set', '_decay_rate',
+        '_dom_counter', '_burst_counter', '_cnter_lock',
+        '_prev_top_set', '_burst_decay_rate',
         '_expiry_heap',
+
+        '_negative_cache', '_negative_lock',
     )
 
     def __init__(self, *, dns_packet=None, request_handler=None, persist=True):
@@ -303,18 +374,33 @@ class DNSCache(dict):
         self._persist = persist
 
         self._dom_counter = Counter()
+        self._burst_counter = Counter()
         self._cnter_lock  = threading.Lock()
         self._expiry_heap = []
 
-        # adaptive decay state -- starts at the most conservative/stable rate until there has been at least one
-        # prior cycle to actually measure churn against.
+        # adaptive burst decay state -- starts at the most conservative/stable rate until there has been at least
+        # one prior cycle to actually measure churn against.
         self._prev_top_set = frozenset()
-        self._decay_rate = TOP_DOMAIN_DECAY_MAX
+        self._burst_decay_rate = BURST_ADAPT_MAX
+
+        # negative cache: dict of qname -> expiry timestamp
+        self._negative_cache = {}
+        self._negative_lock = threading.Lock()
 
         self._load_top_domains()
-        threading.Thread(target=self._auto_clear_cache).start()
+
+        t = threading.Thread(target=self._auto_clear_cache)
+        t.daemon = True
+        t.start()
+
+        t = threading.Thread(target=self._auto_clear_negative)
+        t.daemon = True
+        t.start()
+
         if (dns_packet and request_handler):
-            threading.Thread(target=self._auto_top_domains).start()
+            t = threading.Thread(target=self._auto_top_domains)
+            t.daemon = True
+            t.start()
 
     # searching key directly will return calculated ttl and associated records
     def __getitem__(self, key):
@@ -354,6 +440,30 @@ class DNSCache(dict):
 
         return self[qname]
 
+    def add_negative(self, qname, ttl=NEGATIVE_CACHE_TTL):
+        '''cache that a domain returned nxdomain/servfail so repeat lookups don't hit upstream.'''
+        if (self._is_filtered(qname)):
+            return
+
+        with self._negative_lock:
+            self._negative_cache[qname] = fast_time() + ttl
+
+        Log.verbose(f'[negative cache] added {qname} (ttl={ttl}s)')
+
+    def is_negative(self, qname):
+        '''check if a domain is in the negative cache and still valid. caller should respond with the
+        appropriate nxdomain/servfail response immediately.'''
+        with self._negative_lock:
+            expire = self._negative_cache.get(qname)
+            if (expire is not None):
+                if (fast_time() < expire):
+                    Log.verbose(f'[negative cache] hit {qname}')
+                    return True
+
+                del self._negative_cache[qname]
+
+            return False
+
     def note_lookup(self, domain):
         '''record that a domain caused (or is about to cause) an actual upstream lookup, for top domains ranking
         purposes. callers should only invoke this for genuine, client triggered lookups -- see call sites.
@@ -364,6 +474,7 @@ class DNSCache(dict):
 
         with self._cnter_lock:
             self._dom_counter[domain] += 1
+            self._burst_counter[domain] += 1
 
     @staticmethod
     def _is_filtered(domain):
@@ -391,6 +502,17 @@ class DNSCache(dict):
             if record and record.expire == expire:
                 del self[qname]
 
+    @tools.looper(NEGATIVE_CACHE_CLEAN_INTERVAL)
+    def _auto_clear_negative(self):
+        now = fast_time()
+        with self._negative_lock:
+            expired = [qname for qname, expire in self._negative_cache.items() if expire < now]
+            for qname in expired:
+                del self._negative_cache[qname]
+
+            if (expired):
+                Log.verbose(f'[negative cache] cleaned {len(expired)} expired entries')
+
     @tools.looper(THREE_MIN)
     # automated process to keep the top queried domains permanently in cache. it will use the current caches packet
     # to generate a new packet and add to the standard tls queue. the receiving end will know how to handle this by
@@ -410,21 +532,30 @@ class DNSCache(dict):
             tools.write_cache(top_domains)
 
     def _rank_top_domains(self):
-        '''decays existing scores using the current self tuning rate (pruning anything that falls below one
-        whole lookup equivalent, which also keeps the counter's memory use bounded over long uptimes), ranks the
-        surviving candidates, applies the relative qualification threshold, then adapts the decay rate for next
-        cycle based on how much the qualifying set churned versus last cycle. returns a plain {domain: rank}
-        dict ordered best to worst, ready to persist/relay.'''
+        '''multi-timeframe scoring: decays the burst counter fast (responsive to recent spikes) and the
+        stability counter slowly (recognizes long-term patterns). the combined score = burst + stability
+        captures both. the burst decay rate is self-tuned based on churn, while stability has a fixed slow
+        decay. returns a plain {domain: rank} dict ordered best to worst, ready to persist/relay.'''
         with self._cnter_lock:
-            for domain in list(self._dom_counter):
-                decayed = self._dom_counter[domain] * self._decay_rate
+            for domain in list(self._burst_counter):
+                decayed = self._burst_counter[domain] * self._burst_decay_rate
+                if (decayed < 0.5):
+                    del self._burst_counter[domain]
+                else:
+                    self._burst_counter[domain] = decayed
 
+            for domain in list(self._dom_counter):
+                decayed = self._dom_counter[domain] * STABILITY_DECAY_RATE
                 if (decayed < 1):
                     del self._dom_counter[domain]
                 else:
                     self._dom_counter[domain] = decayed
 
-            ranked = self._dom_counter.most_common(TOP_DOMAIN_COUNT)
+            combined = {
+                domain: self._burst_counter.get(domain, 0) + self._dom_counter.get(domain, 0)
+                for domain in set(self._burst_counter) | set(self._dom_counter)
+            }
+            ranked = Counter(combined).most_common(TOP_DOMAIN_COUNT)
 
         # relative/self-scaling qualification bar -- a domain must still be meaningfully active compared to the
         # current leader, regardless of whether this network generates tens or tens of thousands of lookups per
@@ -432,30 +563,37 @@ class DNSCache(dict):
         peak = ranked[0][1] if ranked else 0
         qualifying = [domain for domain, count in ranked if count >= peak * TOP_DOMAIN_MIN_SHARE]
 
-        self._adapt_decay_rate(frozenset(qualifying))
+        self._adapt_burst_decay(frozenset(qualifying))
 
         return {domain: rank for rank, domain in enumerate(qualifying, 1)}
 
-    def _adapt_decay_rate(self, new_top_set):
-        '''self tuning feedback loop: if the qualifying set is churning heavily cycle to cycle, that suggests the
-        current decay rate is too aggressive relative to the real signal (letting noise dominate), so slow down
-        (retain more history). if the set is stable, speed back up so the system stays maximally responsive to
-        genuine future changes instead of clinging to stale history. always bounded to [TOP_DOMAIN_DECAY_MIN,
-        TOP_DOMAIN_DECAY_MAX] so it can never degenerate to instant amnesia or infinite memory, and the adjustment
-        itself is smoothed (moved halfway to the new target) so the rate doesn't whipsaw cycle to cycle.'''
+    def _adapt_burst_decay(self, new_top_set):
+        '''self tuning feedback loop for the burst counter's decay rate. uses rank-weighted churn:
+        high-rank changes (top of the list) penalized more than tail shuffles, so the rate won't
+        over-react to noise in the long tail. always bounded to [BURST_ADAPT_MIN, BURST_ADAPT_MAX]
+        and smoothed halfway to prevent whipsaw.'''
         if (self._prev_top_set):
-            union_size = len(new_top_set | self._prev_top_set) or 1
-            stable = len(new_top_set & self._prev_top_set)
-            churn = 1 - (stable / union_size)
+            top5_prev = {d for i, d in enumerate(sorted(self._prev_top_set)) if i < 5}
+            top5_new  = {d for i, d in enumerate(sorted(new_top_set)) if i < 5}
 
-            target = TOP_DOMAIN_DECAY_MIN + churn * (TOP_DOMAIN_DECAY_MAX - TOP_DOMAIN_DECAY_MIN)
-            self._decay_rate = (self._decay_rate + target) / 2
+            union_all = len(new_top_set | self._prev_top_set) or 1
+            inter_all = len(new_top_set & self._prev_top_set)
+            union_top5 = len(top5_new | top5_prev) or 1
+            inter_top5 = len(top5_new & top5_prev)
+
+            churn_all  = 1 - (inter_all / union_all)
+            churn_top5 = 1 - (inter_top5 / union_top5)
+
+            churn = 0.3 * churn_all + 0.7 * churn_top5
+
+            target = BURST_ADAPT_MIN + churn * (BURST_ADAPT_MAX - BURST_ADAPT_MIN)
+            self._burst_decay_rate = (self._burst_decay_rate + target) / 2
 
             promoted, demoted = new_top_set - self._prev_top_set, self._prev_top_set - new_top_set
             if (promoted or demoted):
                 Log.verbose(f'[top domains] promoted={sorted(promoted)} demoted={sorted(demoted)}')
 
-            Log.verbose(f'[top domains] churn={churn:.2f} decay_rate={self._decay_rate:.3f}')
+            Log.verbose(f'[top domains] churn={churn:.2f} rate={self._burst_decay_rate:.3f}')
 
         self._prev_top_set = new_top_set
 
@@ -467,6 +605,11 @@ class DNSCache(dict):
 
         dns_cache = tools.load_cache('top_domains')
 
+        loaded = list(dns_cache['top_domains'])
         self._dom_counter = Counter({
-            domain: count for count, domain in enumerate(reversed(list(dns_cache['top_domains'])))
+            domain: count for count, domain in enumerate(reversed(loaded))
+        })
+        # seed burst counter from loaded ranks so newly loaded domains don't start at zero
+        self._burst_counter = Counter({
+            domain: max(3 - rank, 1) for rank, domain in enumerate(loaded, 1)
         })

@@ -41,7 +41,11 @@ By default, the public resolvers are set to **Cloudflare (1.1.1.1)** and **Quad9
 - **Color output** — magenta/blue/green/yellow/red terminal output for different log levels
 - **Debug logging** (`-d`) — blue debug messages independent of verbose mode
 - **Paranoid mode** (`-m`) — memory-only operation; no top-domains cache touches disk
-- **Self-tuning top domains** — adaptive decay rate that adjusts based on observed churn; relative qualification threshold that scales with your network's traffic volume
+- **Multi-timeframe top domains** — dual counters: fast-decay burst counter catches traffic spikes, slow-decay stability counter recognizes long-term patterns; combined scoring promotes domains that are either recently popular or consistently used
+- **Rank-weighted churn adaptation** — burst decay rate is self-tuned using a weighted churn metric (70% top-5 changes, 30% full-set) so noise in the long tail doesn't over-sensitize the system
+- **Negative caching** — NXDOMAIN/SERVFAIL responses are cached for 30s so repeat lookups for nonexistent domains never hit the upstream resolver
+- **Connection pool** — one persistent TLS socket per provider stays open simultaneously; queries fan out to all active providers on cache misses, taking the first response
+- **Latency-aware provider routing** — per-provider exponential moving average of response time; the best-performing provider is preferred for internal top-domain refresh and keepalive traffic
 - **Privacy hardening** — EDNS0 Client Subnet stripping (RFC 7871), EDNS0 padding (RFC 8467, 128-byte block), domain noise filtering
 - **Top domains persistence** — JSON-based across restarts (disabled in paranoid mode)
 - **DNS ID randomization** — random IDs from 70–32000 per query

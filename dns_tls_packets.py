@@ -82,11 +82,24 @@ class ClientRequest:
         send_data += build_dns_response_hdr(self.dns_id, len(cached_domain.records), rd=self.rd, cd=self.cd)
         send_data += self.question_record
 
+        ttl_bytes = long_pack(cached_domain.ttl)
         for record in cached_domain.records:
-            record.ttl = long_pack(cached_domain.ttl)
+            send_data += record.name
+            send_data += record.qtype
+            send_data += record.qclass
+            send_data += ttl_bytes
+            send_data += record.data
 
-            send_data += record
+        self.send_data = send_data
 
+    def generate_negative_response(self):
+        '''build a synthetic NXDOMAIN response for a negatively cached domain.'''
+        if (self.send_data):
+            return
+
+        send_data = bytearray()
+        send_data += build_dns_response_hdr(self.dns_id, 0, rd=self.rd, cd=self.cd, rc=3)
+        send_data += self.question_record
         self.send_data = send_data
 
     def generate_dns_query(self, dns_id: int) -> None:
@@ -151,6 +164,7 @@ def ttl_rewrite(data, dns_id, len=len, min=min, max=max):
     resource_count = _dns_header[3]
     authority_count = _dns_header[4]
     # additional_count = _dns_header[5]
+    rcode = _dns_header[1] & 15
 
     send_data += dns_header[2:]
 
@@ -175,9 +189,12 @@ def ttl_rewrite(data, dns_id, len=len, min=min, max=max):
     # parsing standard and authority records
     for record_count in [resource_count, authority_count]:
 
-        # iterating once for every record based on provided record count. if this number is forged/tampered with it
-        # will cause the parsing to fail. NOTE: ensure this isn't fatal.
-        for _ in range(record_count):
+        # cap the loop at the maximum number of records that could possibly fit in the
+        # remaining payload (each record is at least ~12 bytes) so a forged/tampered
+        # record count from the upstream cannot cause excessive CPU or memory churn.
+        remaining = len(resource_records) - offset
+        max_records = min(record_count, max(remaining // 12, 0))
+        for _ in range(max_records):
             record_type, record, offset = _parse_record(resource_records, offset, dns_payload)
 
             # TTL rewrite done on A records which functionally clamps TTLs between a min and max value. CNAME is listed
@@ -205,9 +222,9 @@ def ttl_rewrite(data, dns_id, len=len, min=min, max=max):
     send_data += resource_records[offset:]
 
     if (record_cache):
-        return send_data, CACHED_RECORD(int(fast_time()) + original_ttl, original_ttl, record_cache)
+        return send_data, CACHED_RECORD(int(fast_time()) + original_ttl, original_ttl, record_cache), rcode
 
-    return send_data, None
+    return send_data, None, rcode
 
 def _parse_record(resource_records, total_offset, dns_query):
     current_record = resource_records[total_offset:]

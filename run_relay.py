@@ -3,6 +3,7 @@
 import os
 import sys
 import time
+import signal
 import argparse
 
 from ipaddress import IPv4Address
@@ -10,6 +11,7 @@ from ipaddress import IPv4Address
 from dns_tls_constants import hard_out, ONE_SEC
 from basic_tools import Log
 from dns_tls_relay import DNSRelay
+from dns_tls_protocols import TLSRelay
 from cli_colors import CLIColors
 
 # override for testing arguments
@@ -91,9 +93,25 @@ if (__name__ == '__main__'):
     # DNSRelay.run only starts background threads then returns immediately, so the main thread blocks here to keep
     # the process alive and to give us a clean, single place to intercept ctrl+c instead of relying on the
     # interpreter's default (noisy) shutdown/thread-join behavior.
+    # signal handlers for graceful shutdown — a second signal forces immediate exit.
+    _shutdown_state = [0]
+
+    def _shutdown(signum, frame):
+        _shutdown_state[0] += 1
+        if _shutdown_state[0] > 1:
+            CLIColors.print_header('\nForcing immediate exit...')
+            hard_out()
+
+        CLIColors.print_header('\nShutting down DNS Relay...')
+        TLSRelay.shutdown()
+        DNSRelay.shutdown()
+        hard_out()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
     try:
         while True:
             time.sleep(ONE_SEC)
     except KeyboardInterrupt:
-        CLIColors.print_header('\nShutting down DNS Relay...')
-        hard_out()
+        _shutdown(None, None)
