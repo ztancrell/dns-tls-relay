@@ -107,3 +107,6 @@ venv.bak/
 # tracked. static/non-sensitive defaults (eg. the noise filter) live in dns_tls_constants.py instead.
 top_domains.json
 top_domains.json.tmp
+
+# opencode agent tooling (plugin config + vendored node_modules) -- not part of this project
+.opencode/
