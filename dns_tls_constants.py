@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
 
-import os as _os
-import time as _time
-
-from functools import partial as _partial
-from itertools import repeat as _repeat
 from struct import Struct as _Struct
 from enum import IntEnum as _IntEnum
 from collections import namedtuple as _namedtuple
 
-fast_time = _time.time
-fast_sleep = _time.sleep
-
-RUN_FOREVER = _partial(_repeat, 1)
-console_log = _partial(print, flush=True)
-hard_out = _partial(_os._exit, 1)
-btoia = _partial(int.from_bytes, byteorder='big', signed=False)
-
-byte_join = b''.join
+# re-exported from basic_tools for backward compatibility with wildcard imports
+from basic_tools import fast_time, fast_sleep, RUN_FOREVER, console_log, hard_out, btoia, byte_join
 
 CONNECT_TIMEOUT = 2
 RELAY_TIMEOUT = 30
@@ -135,6 +123,11 @@ class DNS(_IntEnum):
     TXT   = 16
     AAAA  = 28
     OPT   = 41
+    DS    = 43
+    RRSIG = 46
+    NSEC  = 47
+    DNSKEY = 48
+    NSEC3 = 50
 
     QUERY = 0  # alias
     TOP_DOMAIN = 1  # alias

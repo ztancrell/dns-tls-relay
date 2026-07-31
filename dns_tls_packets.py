@@ -3,7 +3,8 @@
 from collections import namedtuple
 
 from protocol_tools import *
-from advanced_tools import bytecontainer
+
+_dnssec_enabled = False
 
 
 class ClientRequest:
@@ -42,6 +43,9 @@ class ClientRequest:
             return f'dns_query(host={self.address[0]}, port={self.address[1]}, request=Unknown)'
 
     def parse(self, data):
+        if (len(data) < 12):
+            raise ValueError('dns packet too short')
+
         _dns_header, _dns_query = data[:12], data[12:]
 
         # ================
@@ -65,7 +69,10 @@ class ClientRequest:
         # QUESTION RECORD
         # ================
         # www.micro.com or micro.com || sd.micro.com
-        offset, local_domain, self.qname = parse_query_name(_dns_query, qname=True)
+        offset, local_domain, self.qname = parse_query_name(_dns_query, data, qname=True)
+
+        if (len(_dns_query) < offset + 4):
+            raise ValueError('truncated question section')
 
         self.qtype, self.qclass = double_short_unpack(_dns_query[offset:])
         self.question_record = _dns_query[:offset+4]
@@ -109,7 +116,7 @@ class ClientRequest:
         # initializing byte array with (2) bytes. these get overwritten with query len actual after processing
         send_data = bytearray(2)
 
-        header_and_question = build_dns_query_hdr(dns_id, 1, cd=self.cd) + domain_stob(self.qname) + double_short_pack(self.qtype, 1)
+        header_and_question = build_dns_query_hdr(dns_id, 1, cd=(0 if _dnssec_enabled else self.cd)) + domain_stob(self.qname) + double_short_pack(self.qtype, 1)
 
         # privacy hardening for this upstream/WAN facing leg: strip any EDNS Client Subnet option (this relay
         # must never forward the LAN client's address to the public resolver) and pad the query to a fixed
@@ -117,7 +124,7 @@ class ClientRequest:
         # results in exactly one additional record (an OPT record), so the additional record count is hardcoded
         # to 1 above rather than being conditional on whether the client happened to send one itself.
         send_data += header_and_question
-        send_data += sanitize_and_pad_edns(self.additional_records, len(header_and_question))
+        send_data += sanitize_and_pad_edns(self.additional_records, len(header_and_question), dnssec=_dnssec_enabled)
 
         send_data[:2] = short_pack(len(send_data) - 2)
 
@@ -132,7 +139,7 @@ class ClientRequest:
         # hardcoded qtype can change if needed.
         self.qname = qname
         self.qtype = 1
-        self.cd    = 1
+        self.cd    = 0 if _dnssec_enabled else 1
 
         if (keepalive):
             self.generate_dns_query(DNS.KEEPALIVE)
@@ -145,7 +152,21 @@ class ClientRequest:
 # ================
 _records_container = namedtuple('record_container', 'counts records')
 _resource_records = namedtuple('resource_records', 'resource authority')
-_RESOURCE_RECORD = bytecontainer('resource_record', 'name qtype qclass ttl data')
+
+class _ResourceRecord:
+    __slots__ = ('name', 'qtype', 'qclass', 'ttl', 'data')
+
+    def __init__(self, name, qtype, qclass, ttl, data):
+        self.name = name
+        self.qtype = qtype
+        self.qclass = qclass
+        self.ttl = ttl
+        self.data = data
+
+    def __bytes__(self):
+        return self.name + self.qtype + self.qclass + self.ttl + self.data
+
+_RESOURCE_RECORD = _ResourceRecord
 
 _MINIMUM_TTL = long_pack(MINIMUM_TTL)
 _DEFAULT_TTL = long_pack(DEFAULT_TTL)
@@ -172,7 +193,7 @@ def ttl_rewrite(data, dns_id, len=len, min=min, max=max):
     # QUESTION RECORD
     # ================
     # www.micro.com or micro.com || sd.micro.com
-    offset, _ = parse_query_name(dns_payload)
+    offset, _ = parse_query_name(dns_payload, data)
 
     question_record = dns_payload[:offset + 4]
 
@@ -184,7 +205,7 @@ def ttl_rewrite(data, dns_id, len=len, min=min, max=max):
     resource_records = dns_payload[offset + 4:]
 
     # offset is reset to prevent carry over from above.
-    offset, original_ttl, record_cache = 0, 0, []
+    offset, original_ttl, clamped_ttl, record_cache = 0, 0, 0, []
 
     # parsing standard and authority records
     for record_count in [resource_count, authority_count]:
@@ -201,13 +222,16 @@ def ttl_rewrite(data, dns_id, len=len, min=min, max=max):
             # first, followed by A records so the original_ttl var will be whatever the last A record ttl parsed is.
             # generally all A records have the same ttl. CNAME ttl can differ, but will get clamped with A so will
             # likely end up the same as A records.
-            if (record_type in [DNS.A, DNS.CNAME]):
+            if (record_type in (DNS.A, DNS.CNAME, DNS.AAAA)):
+                if (len(record.ttl) != 4):
+                    raise ValueError('truncated ttl')
                 original_ttl = long_unpack(record.ttl)[0]
-                record.ttl = long_pack(
-                    max(MINIMUM_TTL, min(original_ttl, DEFAULT_TTL))
-                )
+                if (original_ttl >= 0x80000000):
+                    original_ttl = 0
+                clamped_ttl = max(MINIMUM_TTL, min(original_ttl, DEFAULT_TTL))
+                record.ttl = long_pack(clamped_ttl)
 
-                send_data += record
+                send_data += bytes(record)
 
                 # limits A record caching so we aren't caching excessive amount of records with the same qname
                 if (len(record_cache) < MAX_A_RECORD_COUNT or record_type != DNS.A):
@@ -215,14 +239,14 @@ def ttl_rewrite(data, dns_id, len=len, min=min, max=max):
 
             # dns system level, mail, and txt records don't need to be clamped and will be relayed to client as is
             else:
-                send_data += record
+                send_data += bytes(record)
 
     # keeping any additional records intact
     # TODO: see if modifying/ manipulating additional records would be beneficial or even useful in any way
     send_data += resource_records[offset:]
 
     if (record_cache):
-        return send_data, CACHED_RECORD(int(fast_time()) + original_ttl, original_ttl, record_cache), rcode
+        return send_data, CACHED_RECORD(int(fast_time()) + clamped_ttl, clamped_ttl, record_cache), rcode
 
     return send_data, None, rcode
 
@@ -233,6 +257,9 @@ def _parse_record(resource_records, total_offset, dns_query):
 
     # resource record data len. generally 4 for ip address, but can vary. calculating first so we can single shot
     # create byte container below.
+    if (len(current_record) < offset + 10):
+        raise ValueError('truncated resource record')
+
     dt_len = btoia(current_record[offset + 8:offset + 10])
 
     resource_record = _RESOURCE_RECORD(

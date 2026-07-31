@@ -137,7 +137,7 @@ class Initialize:
         '''
         if (not self._is_initializing): return
 
-        while wait_for < len(self._thread_ready):
+        while len(self._thread_ready) < wait_for:
             fast_sleep(ONE_SEC)
 
     @property

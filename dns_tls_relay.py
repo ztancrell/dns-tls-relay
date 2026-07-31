@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 import os
+import time
 import threading
 import socket
 import select
 import heapq
 
 from random import randint
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import basic_tools as tools
@@ -25,6 +26,83 @@ __all__ = (
 )
 
 
+class RateLimiter:
+    '''simple token bucket rate limiter per client IP.'''
+    __slots__ = ('_tokens', '_last_refill', '_rate', '_burst', '_lock')
+
+    def __init__(self, rate=50, burst=100):
+        self._tokens = defaultdict(lambda: burst)
+        self._last_refill = defaultdict(fast_time)
+        self._rate = rate
+        self._burst = burst
+        self._lock = threading.Lock()
+
+    def allow(self, client_ip):
+        with self._lock:
+            now = fast_time()
+            last = self._last_refill[client_ip]
+            elapsed = now - last
+            self._tokens[client_ip] = min(self._burst, self._tokens[client_ip] + elapsed * self._rate)
+            self._last_refill[client_ip] = now
+
+            if self._tokens[client_ip] >= 1:
+                self._tokens[client_ip] -= 1
+                return True
+            return False
+
+    def cleanup(self):
+        now = fast_time()
+        with self._lock:
+            stale = [ip for ip, last in list(self._last_refill.items()) if now - last > 60]
+            for ip in stale:
+                del self._tokens[ip]
+                del self._last_refill[ip]
+
+
+class Metrics:
+    '''simple query metrics counter.'''
+    __slots__ = ('_lock', '_total', '_cached', '_negative_hits', '_errors', '_by_type', '_start_time')
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._total = 0
+        self._cached = 0
+        self._negative_hits = 0
+        self._errors = 0
+        self._by_type = Counter()
+        self._start_time = fast_time()
+
+    def record_query(self, qtype):
+        with self._lock:
+            self._total += 1
+            self._by_type[DNS(qtype).name if qtype in iter(DNS) else str(qtype)] += 1
+
+    def record_cache_hit(self):
+        with self._lock:
+            self._cached += 1
+
+    def record_negative_hit(self):
+        with self._lock:
+            self._negative_hits += 1
+
+    def record_error(self):
+        with self._lock:
+            self._errors += 1
+
+    def snapshot(self):
+        with self._lock:
+            uptime = fast_time() - self._start_time
+            return {
+                'uptime': uptime,
+                'total_queries': self._total,
+                'cached_responses': self._cached,
+                'negative_hits': self._negative_hits,
+                'errors': self._errors,
+                'by_type': dict(self._by_type),
+                'cache_hit_ratio': round(self._cached / max(self._total, 1), 3),
+            }
+
+
 class DNSRelay:
     protocol = PROTO.DNS_TLS
 
@@ -32,20 +110,35 @@ class DNSRelay:
     # for tls_up=False.
     tls_up = False
     keepalive_interval = 0
+    keepalive_domain = KEEP_ALIVE_DOMAIN
 
     dns_servers = DNS_SERVERS(
         {'ip': None, PROTO.DNS_TLS: False},
         {'ip': None, PROTO.DNS_TLS: False}
     )
 
-    _executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) + 4))
-    _epoll = select.epoll()
+    _executor = None
+    _max_workers = 32
+    _epoll = None
     _registered_socks = {}
     _socks_lock = threading.Lock()
     _request_map = {}
     _id_lock = threading.Lock()
+    _exec_lock = threading.Lock()
 
     _shutdown_event = threading.Event()
+
+    _rate_limiter = RateLimiter()
+    _dnssec_enabled = False
+    _metrics_port = 9190
+    _metrics = Metrics()
+
+    @classmethod
+    def _get_executor(cls):
+        with cls._exec_lock:
+            if (cls._executor is None):
+                cls._executor = ThreadPoolExecutor(max_workers=min(cls._max_workers, (os.cpu_count() or 1) + 4))
+        return cls._executor
 
     def __init__(self):
         t = threading.Thread(target=self.responder)
@@ -90,12 +183,6 @@ class DNSRelay:
                     pass
             cls._registered_socks.clear()
 
-        tmp = 'top_domains.json.tmp'
-        try:
-            os.remove(tmp)
-        except FileNotFoundError:
-            pass
-
         Log.system('DNS Relay shutdown complete.')
 
     @classmethod
@@ -103,6 +190,7 @@ class DNSRelay:
         Log.system('Initializing primary service...')
 
         cls.keepalive_interval = keepalive_interval
+        cls._epoll = select.epoll()
 
         # running main epoll/ socket loop. threaded so proxy and server can run side by side
         # NOTE: threading.Thread(target=service_loop._listener).start() starting a registration thread for all available
@@ -126,6 +214,80 @@ class DNSRelay:
         t.daemon = True
         t.start()
 
+        t = threading.Thread(target=cls._clean_orphaned_ids)
+        t.daemon = True
+        t.start()
+
+        t = threading.Thread(target=cls._rate_limiter_cleanup)
+        t.daemon = True
+        t.start()
+
+        t = threading.Thread(target=cls._metrics_server)
+        t.daemon = True
+        t.start()
+
+    @classmethod
+    @tools.looper(FIVE_MIN)
+    def _rate_limiter_cleanup(cls):
+        cls._rate_limiter.cleanup()
+
+    @classmethod
+    def _metrics_server(cls):
+        '''simple HTTP metrics endpoint on port 9090 (Prometheus text format).'''
+        port = cls._metrics_port
+        metrics_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        metrics_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            metrics_sock.bind(('127.0.0.1', port))
+            metrics_sock.listen(5)
+            metrics_sock.settimeout(1)
+        except OSError:
+            Log.verbose(f'[metrics] port {port} unavailable, metrics disabled')
+            return
+
+        Log.system(f'[metrics] listening on 127.0.0.1:{port}')
+
+        while not cls._shutdown_event.is_set():
+            try:
+                conn, _ = metrics_sock.accept()
+                with conn:
+                    conn.settimeout(5)
+                    data = conn.recv(1024)
+
+                    # basic HTTP request validation: only respond to GET /metrics
+                    if (not data.startswith(b'GET /metrics ')):
+                        conn.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n')
+                        continue
+
+                    stats = cls._metrics.snapshot()
+                    body = (
+                        '# HELP dns_relay_queries_total Total DNS queries received\n'
+                        f'# TYPE dns_relay_queries_total counter\n'
+                        f'dns_relay_queries_total {stats["total_queries"]}\n'
+                        '# HELP dns_relay_cached_responses Total cached responses served\n'
+                        f'# TYPE dns_relay_cached_responses counter\n'
+                        f'dns_relay_cached_responses {stats["cached_responses"]}\n'
+                        '# HELP dns_relay_negative_hits Total negative cache hits\n'
+                        f'# TYPE dns_relay_negative_hits counter\n'
+                        f'dns_relay_negative_hits {stats["negative_hits"]}\n'
+                        '# HELP dns_relay_errors Total processing errors\n'
+                        f'# TYPE dns_relay_errors counter\n'
+                        f'dns_relay_errors {stats["errors"]}\n'
+                        '# HELP dns_relay_cache_hit_ratio Cache hit ratio\n'
+                        f'# TYPE dns_relay_cache_hit_ratio gauge\n'
+                        f'dns_relay_cache_hit_ratio {stats["cache_hit_ratio"]}\n'
+                        '# HELP dns_relay_uptime_seconds Uptime in seconds\n'
+                        f'# TYPE dns_relay_uptime_seconds counter\n'
+                        f'dns_relay_uptime_seconds {int(stats["uptime"])}\n'
+                    )
+                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n' + body.encode())
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+        metrics_sock.close()
+
     @classmethod
     def _register(cls, listener_ip):
         '''will register interface with listener. requires subclass property for listener_sock returning valid socket
@@ -135,8 +297,8 @@ class DNSRelay:
 
         l_sock = cls._listener_sock(listener_ip)
         with cls._socks_lock:
-            cls._registered_socks[l_sock.fileno()] = L_SOCK(listener_ip, l_sock, l_sock.sendto, l_sock.recvfrom)
             cls._epoll.register(l_sock.fileno(), select.EPOLLIN)
+            cls._registered_socks[l_sock.fileno()] = L_SOCK(listener_ip, l_sock, l_sock.sendto, l_sock.recvfrom)
 
         Log.system(f'[{listener_ip}][{l_sock.fileno()}] Listener registered.')
 
@@ -144,13 +306,16 @@ class DNSRelay:
         epoll_poll = self._epoll.poll
         socks_lock = self._socks_lock
         registered_socks = self._registered_socks
-        submit = self._executor.submit
+        submit = self._get_executor().submit
         shutdown_event = DNSRelay._shutdown_event
 
         while not shutdown_event.is_set():
 
-            l_socks = epoll_poll(timeout=1)
-            for fd, _ in l_socks:
+            try:
+                l_socks = epoll_poll(timeout=1)
+            except InterruptedError:
+                continue
+            for fd, event in l_socks:
 
                 with socks_lock:
                     sock = registered_socks.get(fd)
@@ -158,11 +323,18 @@ class DNSRelay:
                 if (sock is None):
                     continue
 
+                if (event & (select.EPOLLERR | select.EPOLLHUP)):
+                    Log.error(f'[{fd}] epoll error/hup event')
+                    continue
+
                 try:
                     data, address = sock.recvfrom(2048)
 
                 # can happen if poll returns, but packet invalid
                 except OSError:
+                    continue
+
+                if (not DNSRelay._rate_limiter.allow(address[0])):
                     continue
 
                 submit(self._parse_packet, data, address, sock)
@@ -177,6 +349,8 @@ class DNSRelay:
 
         Log.verbose(f'[{client_query.qname}] type={client_query.qtype} from {address}')
 
+        DNSRelay._metrics.record_query(client_query.qtype)
+
         # if query flag is not set the packet will be assumed malformed and silently dropped
         if (local_domain or client_query.qr != DNS.QUERY): return
 
@@ -186,13 +360,14 @@ class DNSRelay:
         try:
             # check negative cache before any upstream work
             if (self._records_cache.is_negative(client_query.qname)):
+                DNSRelay._metrics.record_negative_hit()
                 Log.verbose(f'[{client_query.qname}] negative cache hit, returning nxdomain')
                 client_query.generate_negative_response()
                 self.send_to_client(client_query.send_data, client_query)
                 return
 
-            # A and NS records will have a cache pre-check before sending out
-            if (client_query.qtype in [DNS.A, DNS.NS]):
+            # A, NS, and AAAA records will have a cache pre-check before sending out
+            if (client_query.qtype in [DNS.A, DNS.NS, DNS.AAAA]):
 
                 Log.verbose(f'[{client_query.qname}] routed: cache pre-check')
 
@@ -201,23 +376,18 @@ class DNSRelay:
                 # the signal the top domains heuristic cares about (this domain is about to cause real upstream/WAN
                 # traffic), so it is noted here rather than on every query attempt. NOTE: the top domain refresh
                 # mechanism (DNSCache._auto_top_domains) calls _handle_query directly and never passes through here,
-                # so this can't be self reinforced by the relay's own upkeep traffic.
+                # so this can't be self reinforced by the relay's own upkeep traffic. AAAA records are now cached
+                # and counted towards top domains to reduce WAN chatter for both address families.
                 if not self._cached_response(client_query):
                     self._records_cache_note_lookup(client_query.qname)
                     self._handle_query(client_query)
-
-            # AAAA records does not get cached so the check will be skipped. NOTE: intentionally not counted
-            # towards top domains -- the permanent cache refresh mechanism only ever re-queries the A record for a
-            # domain, so ranking one based on AAAA-only traffic wouldn't actually reduce any real upstream chatter.
-            elif (client_query.qtype in [DNS.AAAA]):
-                Log.verbose(f'[{client_query.qname}] routed: AAAA (cache bypass)')
-                self._handle_query(client_query)
 
             # NOTE: a request reaching this point falls outside the scope of the relay and will be silently dropped
             else:
                 Log.verbose(f'[{client_query.qname}] routed: unhandled type ({client_query.qtype}), dropped')
 
         except Exception as E:
+            DNSRelay._metrics.record_error()
             Log.error(f'[handler/client request] {E}')
 
     def _cached_response(self, client_query):
@@ -253,7 +423,8 @@ class DNSRelay:
 
         Log.verbose(f'Handling query for {client_query.qname} with ID {new_dns_id}.')
 
-        cls._request_map[new_dns_id] = (top_domain, client_query)
+        with cls._id_lock:
+            cls._request_map[new_dns_id] = (fast_time(), top_domain, client_query)
 
         TLSRelay.relay.add(client_query)
 
@@ -263,20 +434,34 @@ class DNSRelay:
 
         with cls._id_lock:
             for _ in range(100):
-                dns_id = randint(70, 32000)
+                dns_id = randint(70, 65534)
                 if (dns_id not in request_map):
-                    request_map[dns_id] = 1
+                    request_map[dns_id] = (fast_time(), False, None)
                     return dns_id
+
+    @classmethod
+    @tools.looper(THIRTY_SEC)
+    def _clean_orphaned_ids(cls):
+        now = fast_time()
+        request_map = cls._request_map
+        with cls._id_lock:
+            orphaned = [dns_id for dns_id, (added_at, _, _) in list(request_map.items()) if added_at and now - added_at > RELAY_TIMEOUT]
+            for dns_id in orphaned:
+                request_map.pop(dns_id, None)
+            if (orphaned):
+                Log.verbose(f'[request map] cleaned {len(orphaned)} orphaned entries')
 
     @relay_queue(Log, name='DNSRelay')
     def responder(self, received_data):
         # dns id is the first 2 bytes in the dns header
         dns_id = short_unpackf(received_data)[0]
 
-        top_domain, client_query = self._request_map_pop(dns_id, (None, None))
-        if (not client_query):
+        entry = self._request_map_pop(dns_id, None)
+        if (entry is None):
             Log.verbose(f'[responder] orphan response for DNS ID {dns_id}')
             return
+
+        added_at, top_domain, client_query = entry
 
         Log.verbose(f'[responder] response for {client_query.qname} (ID {dns_id}) '
                     f'from {client_query.address}')
@@ -286,13 +471,10 @@ class DNSRelay:
         except Exception as E:
             Log.error(f'[parser/server response] {E}')
         else:
-            # cache NXDOMAIN (rc=3) and SERVFAIL (rc=2) responses so repeat lookups don't hit upstream
-            if (rcode in (2, 3) and not top_domain):
-                Log.verbose(f'[responder] negative response (rc={rcode}) for {client_query.qname}')
+            # negative-cache only true NXDOMAIN (rc==3). SERVFAIL (rc==2) is transient / a DNSSEC
+            # validation failure -- forward the real upstream response, never cache it as NXDOMAIN.
+            if (rcode == 3 and not top_domain):
                 self._records_cache.add_negative(client_query.qname)
-                self.send_to_client(server_response, client_query)
-                return
-
             if (not top_domain):
                 Log.verbose(f'[responder] forwarding {len(server_response)} bytes to '
                             f'{client_query.address}')
@@ -358,7 +540,7 @@ class DNSCache(dict):
 
         '_dom_counter', '_burst_counter', '_cnter_lock',
         '_prev_top_set', '_burst_decay_rate',
-        '_expiry_heap',
+        '_expiry_heap', '_heap_lock',
 
         '_negative_cache', '_negative_lock',
     )
@@ -377,6 +559,7 @@ class DNSCache(dict):
         self._burst_counter = Counter()
         self._cnter_lock  = threading.Lock()
         self._expiry_heap = []
+        self._heap_lock   = threading.Lock()
 
         # adaptive burst decay state -- starts at the most conservative/stable rate until there has been at least
         # one prior cycle to actually measure churn against.
@@ -429,8 +612,9 @@ class DNSCache(dict):
 
     def add(self, qname, data_to_cache):
         '''add query to cache after calculating expiration time.'''
-        self[qname] = data_to_cache
-        heapq.heappush(self._expiry_heap, (data_to_cache.expire, qname))
+        with self._heap_lock:
+            self[qname] = data_to_cache
+            heapq.heappush(self._expiry_heap, (data_to_cache.expire, qname))
 
         Log.verbose(f'[{qname}:{data_to_cache.ttl}] Added to standard cache. ')
 
@@ -496,11 +680,12 @@ class DNSCache(dict):
     def _auto_clear_cache(self):
         now = fast_time()
         heap = self._expiry_heap
-        while heap and heap[0][0] <= now:
-            expire, qname = heapq.heappop(heap)
-            record = self.get(qname)
-            if record and record.expire == expire:
-                del self[qname]
+        with self._heap_lock:
+            while heap and heap[0][0] <= now:
+                expire, qname = heapq.heappop(heap)
+                record = self.get(qname)
+                if record and record.expire == expire:
+                    del self[qname]
 
     @tools.looper(NEGATIVE_CACHE_CLEAN_INTERVAL)
     def _auto_clear_negative(self):
@@ -557,13 +742,13 @@ class DNSCache(dict):
             }
             ranked = Counter(combined).most_common(TOP_DOMAIN_COUNT)
 
-        # relative/self-scaling qualification bar -- a domain must still be meaningfully active compared to the
-        # current leader, regardless of whether this network generates tens or tens of thousands of lookups per
-        # cycle, rather than needing to clear some fixed absolute count.
-        peak = ranked[0][1] if ranked else 0
-        qualifying = [domain for domain, count in ranked if count >= peak * TOP_DOMAIN_MIN_SHARE]
+            # relative/self-scaling qualification bar -- a domain must still be meaningfully active compared to the
+            # current leader, regardless of whether this network generates tens or tens of thousands of lookups per
+            # cycle, rather than needing to clear some fixed absolute count.
+            peak = ranked[0][1] if ranked else 0
+            qualifying = [domain for domain, count in ranked if count >= peak * TOP_DOMAIN_MIN_SHARE]
 
-        self._adapt_burst_decay(frozenset(qualifying))
+            self._adapt_burst_decay(frozenset(qualifying))
 
         return {domain: rank for rank, domain in enumerate(qualifying, 1)}
 

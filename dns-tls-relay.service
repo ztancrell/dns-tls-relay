@@ -1,0 +1,30 @@
+[Unit]
+Description=DNS-over-TLS Relay
+Documentation=https://github.com/dowrighttv/dns-tls-relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/sbin/python3 /home/zpt/dns-tls-relay/run_relay.py -l 192.168.254.90 -r 1.1.1.1 9.9.9.9 -c --color
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+User=root
+WorkingDirectory=/home/zpt/dns-tls-relay
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/home/zpt/dns-tls-relay
+ProtectHome=read-only
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dns-tls-relay
+
+[Install]
+WantedBy=multi-user.target

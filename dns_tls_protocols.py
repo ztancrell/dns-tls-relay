@@ -27,6 +27,7 @@ class ProviderConnection:
         'server_ip', 'sock', 'tls_version',
         'send_cnt', 'last_rcvd', 'last_send_time',
         'avg_latency', 'success_count', 'fail_count',
+        '_reconnecting',
     )
 
     def __init__(self, server_ip, sock, tls_version):
@@ -39,6 +40,7 @@ class ProviderConnection:
         self.avg_latency = 0.0
         self.success_count = 0
         self.fail_count = 0
+        self._reconnecting = False
 
     @property
     def is_active(self):
@@ -288,28 +290,36 @@ class TLSRelay(ProtoRelay):
         '''close and reconnect a single provider. used when a send fails on
         an otherwise-active connection.'''
         try:
-            provider.sock.close()
-        except OSError:
-            pass
+            try:
+                provider.sock.close()
+            except (OSError, AttributeError):
+                pass
 
-        provider.sock = None
-        Log.verbose(f'[{provider.server_ip}] Reconnecting...')
+            provider.sock = None
+            Log.verbose(f'[{provider.server_ip}] Reconnecting...')
 
-        new_provider = self._tls_connect(provider.server_ip)
-        if (new_provider):
+            new_provider = self._tls_connect(provider.server_ip)
+            if (new_provider):
+                with self._providers_lock:
+                    try:
+                        self._providers.remove(provider)
+                    except ValueError:
+                        pass
+                    self._providers.append(new_provider)
+                t = threading.Thread(target=self._recv_handler, args=(new_provider,))
+                t.daemon = True
+                t.start()
+                return True
+
             with self._providers_lock:
-                self._providers.remove(provider)
-                self._providers.append(new_provider)
-            t = threading.Thread(target=self._recv_handler, args=(new_provider,))
-            t.daemon = True
-            t.start()
-            return True
-
-        with self._providers_lock:
-            if provider in self._providers:
-                self._providers.remove(provider)
-        self.mark_server_down(remote_server=provider.server_ip)
-        return False
+                try:
+                    self._providers.remove(provider)
+                except ValueError:
+                    pass
+            self.mark_server_down(remote_server=provider.server_ip)
+            return False
+        finally:
+            provider._reconnecting = False
 
     # overrides ProtoRelay._register_new_socket to work with the pool
     def _register_new_socket(self, client_query=None):
@@ -346,7 +356,7 @@ class TLSRelay(ProtoRelay):
 
         for provider in targets:
             try:
-                provider.sock.send(client_query.send_data)
+                provider.sock.sendall(client_query.send_data)
                 provider.send_cnt += 1
                 provider.last_send_time = fast_time()
                 Log.console(
@@ -354,7 +364,9 @@ class TLSRelay(ProtoRelay):
                 )
             except (OSError, AttributeError):
                 Log.verbose(f'[{provider.server_ip}] send failed, attempting reconnect...')
-                self._reconnect_provider(provider)
+                if (not getattr(provider, '_reconnecting', False)):
+                    provider._reconnecting = True
+                    threading.Thread(target=self._reconnect_provider, args=(provider,), daemon=True).start()
 
     def _recv_handler(self, provider):
         '''per-connection receive handler. reads responses from a single provider's
@@ -364,62 +376,57 @@ class TLSRelay(ProtoRelay):
 
         conn_recv = provider.sock.recv
 
-        recv_buffer = []
-        recv_buff_append = recv_buffer.append
-        recv_buff_clear  = recv_buffer.clear
+        recv_buffer = bytearray()
 
         responder_add = self.DNSRelay.responder.add
 
         for _ in RUN_FOREVER():
             try:
                 data_from_server = conn_recv(2048)
-
             except OSError:
                 break
+            if (not data_from_server):
+                break
 
-            else:
-                if (not data_from_server):
+            now = fast_time()
+            provider.last_rcvd = now
+            provider.send_cnt = 0
+            if (provider.last_send_time):
+                provider.record_latency(now - provider.last_send_time)
+            self._keepalive_event.set()
+
+            recv_buffer += data_from_server
+
+            while (len(recv_buffer) >= 2):
+                data_len = short_unpackf(recv_buffer)[0]
+                total_len = 2 + data_len
+
+                # invalid frame length: the TLS stream is desynced, force a clean reconnect
+                if (data_len < 12 or data_len > 65535):
+                    Log.error(f'[{provider.server_ip}] invalid frame length ({data_len}), closing connection')
+                    try:
+                        provider.sock.close()
+                    except (OSError, AttributeError):
+                        pass
+                    recv_buffer.clear()
                     break
 
-                now = fast_time()
-                provider.last_rcvd = now
-                provider.send_cnt = 0
+                if (len(recv_buffer) < total_len):
+                    break
 
-                if (provider.last_send_time):
-                    provider.record_latency(now - provider.last_send_time)
+                frame = bytes(recv_buffer[2:total_len])
+                del recv_buffer[:total_len]
 
-                self._keepalive_event.set()
+                if (short_unpackf(frame)[0] != DNS.KEEPALIVE):
+                    responder_add(frame)
 
-                recv_buff_append(data_from_server)
-                while recv_buffer:
-                    current_data = byte_join(recv_buffer)
-
-                    # need at least 2 bytes for the DNS-over-TLS length prefix
-                    if (len(current_data) < 2): break
-
-                    data_len = short_unpackf(current_data)[0]
-                    total_len = 2 + data_len
-
-                    # minimum valid DNS message is 12 bytes (header only); reject
-                    # malformed frames that would desync the parser or waste memory.
-                    if (data_len < 12):
-                        recv_buff_clear()
-                        Log.error(f'[{provider.server_ip}] invalid frame length ({data_len}), discarding')
-                        break
-
-                    if (len(current_data) < total_len): break
-
-                    recv_buff_clear()
-                    frame = current_data[2:total_len]
-
-                    if (len(current_data) > total_len):
-                        recv_buff_append(current_data[total_len:])
-
-                    if (frame[0] != DNS.KEEPALIVE):
-                        responder_add(frame)
-
-        provider.sock.close()
+        _sock = provider.sock
         provider.sock = None
+        if (_sock is not None):
+            try:
+                _sock.close()
+            except (OSError, AttributeError):
+                pass
 
         Log.verbose(f'[{provider.server_ip}/{self._protocol.name}] Connection closed.')
 
@@ -433,14 +440,23 @@ class TLSRelay(ProtoRelay):
 
         sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
 
-        dot_sock = self._tls_context.wrap_socket(sock, server_hostname=tls_server)
+        try:
+            dot_sock = self._tls_context.wrap_socket(sock, server_hostname=tls_server)
+        except OSError:
+            sock.close()
+            return None
+
         try:
             dot_sock.connect((tls_server, PROTO.DNS_TLS))
         except OSError as ose:
             Log.error(f'[{tls_server}/{self._protocol.name}] Failed to connect. {ose}')
+            dot_sock.close()
+            return None
 
         except Exception as E:
             Log.error(f'[{tls_server}/{self._protocol.name}] While attempting to connect: {E}')
+            dot_sock.close()
+            return None
 
         else:
             dot_sock.settimeout(RELAY_TIMEOUT)
@@ -450,8 +466,6 @@ class TLSRelay(ProtoRelay):
             Log.verbose(f'[{tls_server}] TLS {tls_version} cipher={tls_cipher[0]}')
 
             return ProviderConnection(tls_server, dot_sock, tls_version)
-
-        return None
 
     def mark_server_down(self, *, remote_server=None):
         '''mark a provider as down in the server status dict (no-op for closing the
@@ -477,7 +491,7 @@ class TLSRelay(ProtoRelay):
             if keepalive_timer(keepalive_interval):
                 keepalive_continue()
             else:
-                relay_add(self._dns_packet(KEEP_ALIVE_DOMAIN, keepalive=True))
+                relay_add(self._dns_packet(self.DNSRelay.keepalive_domain, keepalive=True))
                 Log.debug(f'[keepalive][{keepalive_interval}] Added to relay queue')
 
     @looper(FIVE_SEC)
@@ -593,7 +607,12 @@ class Reachability:
         sock = socket(AF_INET, SOCK_STREAM)
         sock.settimeout(CONNECT_TIMEOUT)
 
-        secure_socket = self._tls_context.wrap_socket(sock, server_hostname=secure_server)
+        try:
+            secure_socket = self._tls_context.wrap_socket(sock, server_hostname=secure_server)
+        except OSError:
+            sock.close()
+            return False
+
         try:
             secure_socket.connect((secure_server, PROTO.DNS_TLS))
         except OSError:

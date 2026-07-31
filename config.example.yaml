@@ -1,0 +1,21 @@
+relay:
+  listen:
+    - 127.0.0.1
+    - 192.168.1.1
+  resolvers:
+    - 1.1.1.1
+    - 9.9.9.9
+  keepalive: 6
+  keepalive_domain: "dnxfirewall.com"
+  workers: 32
+  console: true
+  verbose: false
+  debug: false
+  memory_only: false
+
+dnssec: true  # enforce validation at the upstream resolver (DO bit + CD=0); set false to disable
+
+rate_limit: 50
+rate_burst: 100
+
+metrics_port: 9190

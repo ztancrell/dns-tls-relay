@@ -10,7 +10,9 @@ def parse_query_name(data, dns_query=None, *, qname=False):
     if not data:
         return (0, True) if not qname else (0, True, '')
 
-    while data[0]:
+    visited_pointers = set()
+
+    while data and data[0]:
 
         # adding 1 to section_len to account for itself
         section_len, data = data[0], data[1:]
@@ -22,7 +24,17 @@ def parse_query_name(data, dns_query=None, *, qname=False):
 
             # calculates the value of the pointer then uses value as original dns query index. this used to be a
             # separate function, but it felt like a waste so merged it. (-12 accounts for header not included)
-            data = dns_query[((section_len << 8 | data[0]) & 16383) - 12:]
+            if (not data):
+                break
+            pointer_offset = (section_len << 8 | data[0]) & 16383
+            if pointer_offset in visited_pointers:
+                break
+            visited_pointers.add(pointer_offset)
+
+            target = pointer_offset - 12
+            if (target < 0 or target >= len(dns_query)):
+                break
+            data = dns_query[target:]
 
             contains_pointer = True
 
@@ -30,7 +42,7 @@ def parse_query_name(data, dns_query=None, *, qname=False):
             # name len + integer value of initial length
             offset += section_len + 1 if not contains_pointer else 0
 
-            query_name.append(data[:section_len].decode())
+            query_name.append(data[:section_len].decode('latin-1'))
 
             # slicing out processed section
             data = data[section_len:]
@@ -106,7 +118,7 @@ def _parse_single_opt_record(additional_records):
 
     return udp_size, ext_rcode_flags, options
 
-def sanitize_and_pad_edns(additional_records, unpadded_len):
+def sanitize_and_pad_edns(additional_records, unpadded_len, *, dnssec=False):
     '''privacy hardening for the upstream (WAN facing) leg of the relay:
 
       1. strips any EDNS Client Subnet option (RFC 7871) -- this relay exists to keep the LAN client's
@@ -119,18 +131,23 @@ def sanitize_and_pad_edns(additional_records, unpadded_len):
     unpadded_len is the length, in bytes, of the dns message (header + question) NOT including these additional
     records, needed to compute how much padding lands the total on a block boundary.
 
-    if additional_records is non-empty and doesn't parse as exactly one well formed OPT record, it is returned
-    completely unmodified rather than risking corrupting an unusual/malformed packet -- the client just won't
-    get the padding benefit for that one query.
+    if additional_records is non-empty and doesn't parse as exactly one well formed OPT record, it is dropped
+    and a fresh minimal OPT record with padding is synthesized -- the client won't get any options forwarded
+    for that one query.
     '''
     if (not additional_records):
         udp_size, ext_rcode_flags, options = EDNS_DEFAULT_UDP_SIZE, long_pack(0), []
     else:
         parsed = _parse_single_opt_record(additional_records)
         if (parsed is None):
-            return additional_records
+            udp_size, ext_rcode_flags, options = EDNS_DEFAULT_UDP_SIZE, long_pack(0), []
+        else:
+            udp_size, ext_rcode_flags, options = parsed
 
-        udp_size, ext_rcode_flags, options = parsed
+    # set DNSSEC OK (DO) bit (0x8000) if DNSSEC validation is enabled
+    if (dnssec):
+        flags = long_unpack(ext_rcode_flags)[0] | 0x8000
+        ext_rcode_flags = long_pack(flags)
 
     options = [[code, data] for code, data in options if code != EDNS_ECS_CODE]
 

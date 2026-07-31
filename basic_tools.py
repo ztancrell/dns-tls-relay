@@ -3,11 +3,25 @@
 import os
 import json
 
+import os as _os
+import time as _time
+
+from functools import partial as _partial
+from itertools import repeat as _repeat
+
 from cli_colors import CLIColors
 
 from datetime import datetime, timezone
 
-from dns_tls_constants import *
+fast_time = _time.time
+fast_sleep = _time.sleep
+
+RUN_FOREVER = _partial(_repeat, 1)
+console_log = _partial(print, flush=True)
+hard_out = _partial(_os._exit, 1)
+btoia = _partial(int.from_bytes, byteorder='big', signed=False)
+
+byte_join = b''.join
 
 def load_cache(filename):
     '''loads named json cache file from disk. returns sane defaults if the file is missing, unreadable, or
@@ -69,35 +83,15 @@ def looper(sleep_len):
 
 
 class Log:
+    _verbose_enabled = False
+    _debug_enabled = False
+    _console_enabled = False
 
     @classmethod
     def setup(cls, *, console, verbose, debug=False):
-        # define function to print log message. this will overload verbose function if enabled.
-        if (verbose):
-
-            @classmethod
-            def func(cls, thing_to_print):
-                CLIColors.print_ok(f'[{cls.time()}][verbose]{thing_to_print}')
-
-            # overloading verbose method with newly defined function.
-            cls.verbose = func
-
-        if (debug):
-
-            @classmethod
-            def func(cls, thing_to_print):
-                CLIColors.print_info(f'[{cls.time()}][debug]{thing_to_print}')
-
-            cls.debug = func
-
-        if (console):
-
-            @classmethod
-            def func(cls, thing_to_print):
-                CLIColors.print_header(f'[{cls.time()}][console]{thing_to_print}')
-
-            # overloading console method with newly defined function.
-            cls.console = func
+        cls._verbose_enabled = verbose
+        cls._debug_enabled = debug
+        cls._console_enabled = console
 
     @classmethod
     def system(cls, msg):
@@ -105,19 +99,22 @@ class Log:
 
     @classmethod
     def console(cls, msg):
-        pass
+        if cls._console_enabled:
+            CLIColors.print_header(f'[{cls.time()}][console]{msg}')
 
     @classmethod
     def error(cls, msg):
         console_log(f'[{cls.time()}][error]{msg}')
 
-    @staticmethod
-    def verbose(msg):
-        pass
+    @classmethod
+    def verbose(cls, msg):
+        if cls._verbose_enabled:
+            CLIColors.print_ok(f'[{cls.time()}][verbose]{msg}')
 
-    @staticmethod
-    def debug(msg):
-        pass
+    @classmethod
+    def debug(cls, msg):
+        if cls._debug_enabled:
+            CLIColors.print_info(f'[{cls.time()}][debug]{msg}')
 
     @staticmethod
     def time(tz=timezone.utc):

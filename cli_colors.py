@@ -1,29 +1,44 @@
+import sys
+
+
 class CLIColors:
-    HEADER = "\033[95m"  # Magenta
-    OKBLUE = "\033[94m"  # Blue
-    OKGREEN = "\033[92m"  # Green
-    WARNING = "\033[93m"  # Yellow
-    FAIL = "\033[91m"  # Red
-    ENDC = "\033[0m"  # Reset
-    BOLD = "\033[1m"  # Bold
-    UNDERLINE = "\033[4m"  # Underline
+    HEADER = "\033[95m"
+    OKBLUE = "\033[94m"
+    OKGREEN = "\033[92m"
+    WARNING = "\033[93m"
+    FAIL = "\033[91m"
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
+    UNDERLINE = "\033[4m"
 
-    @staticmethod
-    def print_header(text):
-        print(f"{CLIColors.HEADER}{text}{CLIColors.ENDC}")
+    _enabled = sys.stderr.isatty()
 
-    @staticmethod
-    def print_ok(text):
-        print(f"{CLIColors.OKGREEN}{text}{CLIColors.ENDC}")
+    @classmethod
+    def enable(cls, enabled):
+        cls._enabled = enabled
 
-    @staticmethod
-    def print_warning(text):
-        print(f"{CLIColors.WARNING}{text}{CLIColors.ENDC}")
+    @classmethod
+    def _colorize(cls, color, text):
+        if cls._enabled:
+            return f"{color}{text}{cls.ENDC}"
+        return text
 
-    @staticmethod
-    def print_error(text):
-        print(f"{CLIColors.FAIL}{text}{CLIColors.ENDC}")
+    @classmethod
+    def print_header(cls, text):
+        print(cls._colorize(cls.HEADER, text))
 
-    @staticmethod
-    def print_info(text):
-        print(f"{CLIColors.OKBLUE}{text}{CLIColors.ENDC}")
+    @classmethod
+    def print_ok(cls, text):
+        print(cls._colorize(cls.OKGREEN, text))
+
+    @classmethod
+    def print_warning(cls, text):
+        print(cls._colorize(cls.WARNING, text))
+
+    @classmethod
+    def print_error(cls, text):
+        print(cls._colorize(cls.FAIL, text))
+
+    @classmethod
+    def print_info(cls, text):
+        print(cls._colorize(cls.OKBLUE, text))
