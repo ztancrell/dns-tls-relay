@@ -125,6 +125,16 @@ sudo systemctl enable dns-tls-relay
 sudo systemctl start dns-tls-relay
 ```
 
+### OpenRC Installation (Artix, Gentoo)
+
+```bash
+sudo install -m 755 dns-tls-relay.openrc /etc/init.d/dns-tls-relay
+sudo rc-update add dns-tls-relay default
+sudo rc-service dns-tls-relay start
+```
+
+Logs go to `/var/log/dns-tls-relay.log`.
+
 ### Build System
 
 ```bash

@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+# OpenRC port of dns-tls-relay.service, for Artix.
+# Install: sudo install -m 755 dns-tls-relay.openrc /etc/init.d/dns-tls-relay
+#          sudo rc-update add dns-tls-relay default && sudo rc-service dns-tls-relay start
+# Logs: /var/log/dns-tls-relay.log (systemd sent them to the journal).
+
+description="DNS-over-TLS Relay"
+command=/usr/bin/python3
+command_args="/home/zpt/dns-tls-relay/run_relay.py -l 192.168.254.90 -r 1.1.1.1 9.9.9.9 -c"
+directory=/home/zpt/dns-tls-relay
+supervisor=supervise-daemon
+# Restart=on-failure, RestartSec=5. No retry cap: at boot NetworkManager may not have
+# assigned 192.168.254.90 yet, so the first binds can fail until DHCP finishes.
+respawn_delay=5
+respawn_max=0
+output_log=/var/log/dns-tls-relay.log
+error_log=/var/log/dns-tls-relay.log
+
+extra_started_commands="reload"
+
+depend() {
+	need net
+}
+
+reload() {
+	ebegin "Reloading ${RC_SVCNAME}"
+	supervise-daemon "${RC_SVCNAME}" --signal HUP
+	eend $?
+}
